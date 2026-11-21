@@ -137,13 +137,20 @@ def pack_workers(selected_nums: set[int], dur_by_num: dict[int, int]) -> list[li
         return []
 
     sorted_tests = sorted(selected_nums, key=lambda n: (-dur_by_num[n], n))
+    total_dur = sum(dur_by_num[n] for n in sorted_tests)
+    if total_dur <= WORKER_COST_MS or len(sorted_tests) == 1:
+        return [sorted_tests]
+
+    max_dur = dur_by_num[sorted_tests[0]]
     max_k = min(MAX_WORKERS, len(sorted_tests))
 
     best_workers: list[list[int]] = [sorted_tests]
-    best_busiest = sum(dur_by_num[n] for n in sorted_tests)
-    best_k = 1
+    best_score = total_dur + WORKER_COST_MS
 
     for k in range(2, max_k + 1):
+        lb = max(max_dur, (total_dur + k - 1) // k) + WORKER_COST_MS * k
+        if lb >= best_score:
+            continue
         workers: list[list[int]] = [[] for _ in range(k)]
         loads = [0] * k
         for tnum in sorted_tests:
@@ -153,10 +160,10 @@ def pack_workers(selected_nums: set[int], dur_by_num: dict[int, int]) -> list[li
         busiest = _refine_partition(workers, loads, dur_by_num)
         occupied = [w for w in workers if w]
         eff_k = len(occupied)
-        if busiest + WORKER_COST_MS * eff_k < best_busiest + WORKER_COST_MS * best_k:
+        score = busiest + WORKER_COST_MS * eff_k
+        if score < best_score:
             best_workers = occupied
-            best_busiest = busiest
-            best_k = eff_k
+            best_score = score
 
     return best_workers
 
@@ -348,6 +355,7 @@ class ChangeItem:
         "dict_val_node",
         "new_dict_val_node",
         "target_node",
+        "is_sig_change",
     )
 
     def __init__(
@@ -359,6 +367,7 @@ class ChangeItem:
         dict_val_node: ast.AST | None,
         new_dict_val_node: ast.AST | None,
         target_node: ast.AST,
+        is_sig_change: bool = False,
     ) -> None:
         self.enclosing_class = enclosing_class
         self.enclosing_func = enclosing_func
@@ -367,6 +376,7 @@ class ChangeItem:
         self.dict_val_node = dict_val_node
         self.new_dict_val_node = new_dict_val_node
         self.target_node = target_node
+        self.is_sig_change = is_sig_change
 
 
 def ast_equal(a: ast.AST | None, b: ast.AST | None) -> bool:
@@ -692,7 +702,9 @@ def diff_ast_nodes(
             ):
                 if not is_runtime_noop_node(o_stmt, n_stmt, has_future_annot):
                     changes.append(
-                        ChangeItem(enclosing_class, o_stmt, None, None, None, None, o_stmt)
+                        ChangeItem(
+                            enclosing_class, o_stmt, None, None, None, None, o_stmt, True
+                        )
                     )
                 return
             diff_stmt_list(o_stmt.body, n_stmt.body, o_stmt, enclosing_class, o_stmt)
@@ -882,12 +894,58 @@ def extract_referenced_exp_names(node: ast.AST | None) -> set[str]:
     return names
 
 
-def select_tests_for_patch(
+def _parse_optimizer_sql_fixture(text: str) -> list[tuple[tuple[tuple[str, str], ...], str, str]]:
+    """Mirror tests/helpers.py load_sql_fixture_pairs, ignoring '--' comments and '# title:' labels."""
+    filtered = "\n".join(line for line in text.splitlines() if line and not line.startswith("--"))
+    stmts = filtered.split(";")
+    out: list[tuple[tuple[tuple[str, str], ...], str, str]] = []
+    size = len(stmts)
+    for i in range(0, size, 2):
+        if i + 1 < size:
+            sql = stmts[i].strip()
+            lines = sql.split("\n")
+            meta: list[tuple[str, str]] = []
+            j = 0
+            while j < len(lines) and lines[j].startswith("#"):
+                if ":" in lines[j]:
+                    k, v = lines[j].split(":", 1)
+                    k = k.lstrip("#").strip()
+                    if k != "title":
+                        meta.append((k, v.strip()))
+                else:
+                    meta.append((lines[j], ""))
+                j += 1
+            sql_body = "\n".join(lines[j:])
+            expected = stmts[i + 1].strip()
+            out.append((tuple(sorted(meta)), sql_body, expected))
+    return out
+
+
+NON_VERIFIABLE_TEST_FILES = frozenset(
+    {
+        "tests/test_optimizer.py",
+        "tests/test_executor.py",
+        "tests/test_lineage.py",
+        "tests/helpers.py",
+        "tests/test_build.py",
+        "tests/test_sqlglotc.py",
+        "tests/test_docs.py",
+    }
+)
+
+
+def analyze_patch(
     patch_text: str,
     cov_map: dict,
-    verifier: InProcessVerifier | None = None,
-    dur_by_num: dict[int, int] | None = None,
-) -> set[int]:
+) -> tuple[
+    set[int],
+    set[int],
+    bool,
+    list[tuple[str, str]],
+    list[tuple[str, int, int]] | None,
+    set[str],
+    bool,
+]:
     test_sets: list[tuple[int, ...]] = cov_map["test_sets"]
     line_cov: dict[str, dict[int, int]] = cov_map["line_cov"]
     setup_cov: dict[str, dict[int, int]] = cov_map["setup_cov"]
@@ -899,11 +957,15 @@ def select_tests_for_patch(
     dialect_symbol_cov: dict[str, dict[str, int]] = cov_map.get("dialect_symbol_cov", {})
     file_import_cov: dict[str, int] = cov_map["file_import_cov"]
     sources: dict[str, bytes] = cov_map["sources"]
+    fixtures_map: dict[str, bytes] = cov_map.get("fixtures", {})
 
     non_py_selected: set[int] = set()
     selected: set[int] = set()
     changed_py_files: list[tuple[str, str]] = []
     can_verify_py = True
+    group_c_safe = True
+    pure_func_line_spans: list[tuple[str, int, int]] | None = []
+    modified_sql_fixtures: set[str] = set()
     parsed_files = parse_unified_diff(patch_text)
 
     for rel_path, hunks in parsed_files:
@@ -923,6 +985,20 @@ def select_tests_for_patch(
                 if not has_non_comment_change:
                     continue
 
+                # Exact semantic fixture pair check for optimizer/*.sql fixtures
+                if rel_path.startswith("tests/fixtures/optimizer/") and rel_path in fixtures_map:
+                    try:
+                        old_sql = zlib.decompress(fixtures_map[rel_path]).decode("utf-8")
+                        new_sql = apply_hunks(old_sql, hunks)
+                        if _parse_optimizer_sql_fixture(old_sql) == _parse_optimizer_sql_fixture(
+                            new_sql
+                        ):
+                            continue
+                    except Exception:
+                        pass
+                if rel_path.startswith("tests/fixtures/"):
+                    modified_sql_fixtures.add(rel_path[len("tests/fixtures/") :])
+
             f_set_id = fixture_cov.get(rel_path)
             if f_set_id:
                 non_py_selected.update(test_sets[f_set_id])
@@ -937,6 +1013,7 @@ def select_tests_for_patch(
         comp_src = sources.get(rel_path)
         if comp_src is None:
             can_verify_py = False
+            pure_func_line_spans = None
             sid = file_import_cov.get(rel_path)
             if sid:
                 selected.update(test_sets[sid])
@@ -949,6 +1026,7 @@ def select_tests_for_patch(
             new_tree = ast.parse(new_source, filename=rel_path)
         except Exception:
             can_verify_py = False
+            pure_func_line_spans = None
             sid = file_import_cov.get(rel_path)
             if sid:
                 selected.update(test_sets[sid])
@@ -964,7 +1042,28 @@ def select_tests_for_patch(
             continue
 
         if not rel_path.startswith("sqlglot/"):
-            can_verify_py = False
+            pure_func_line_spans = None
+            if not (rel_path.startswith("tests/") and rel_path not in NON_VERIFIABLE_TEST_FILES):
+                can_verify_py = False
+        if rel_path in (
+            "sqlglot/jsonpath.py",
+            "sqlglot/tokens.py",
+            "sqlglot/transforms.py",
+            "sqlglot/_typing.py",
+            "sqlglot/serde.py",
+        ):
+            group_c_safe = False
+        elif rel_path == "sqlglot/dialects/dialect.py":
+            if not all(
+                it.enclosing_class == "Dialect"
+                and it.enclosing_func is not None
+                and not it.is_sig_change
+                for it in changes
+            ):
+                group_c_safe = False
+        elif rel_path == "sqlglot/schema.py":
+            if not all(it.enclosing_func is not None and not it.is_sig_change for it in changes):
+                group_c_safe = False
         changed_py_files.append((rel_path, new_source))
 
         file_lines = line_cov.get(rel_path, {})
@@ -985,6 +1084,8 @@ def select_tests_for_patch(
             if item.enclosing_func is not None:
                 l_start = getattr(item.target_node, "lineno", item.enclosing_func.lineno)
                 l_end = getattr(item.target_node, "end_lineno", l_start)
+                f_start = item.enclosing_func.lineno
+                f_end = getattr(item.enclosing_func, "end_lineno", f_start)
 
                 node_tests: set[int] = set()
                 hit_import_line = False
@@ -998,9 +1099,9 @@ def select_tests_for_patch(
                     if lno in file_imp_lines:
                         hit_import_line = True
 
+                used_full_func = False
                 if hit_import_line and not node_tests:
-                    f_start = item.enclosing_func.lineno
-                    f_end = getattr(item.enclosing_func, "end_lineno", f_start)
+                    used_full_func = True
                     for lno in range(f_start, f_end + 1):
                         sid = file_lines.get(lno)
                         if sid:
@@ -1010,8 +1111,7 @@ def select_tests_for_patch(
                             node_tests.update(test_sets[ssid])
 
                 if not node_tests and item.target_node is item.enclosing_func:
-                    f_start = item.enclosing_func.lineno
-                    f_end = getattr(item.enclosing_func, "end_lineno", f_start)
+                    used_full_func = True
                     for lno in range(f_start, f_end + 1):
                         sid = file_lines.get(lno)
                         if sid:
@@ -1020,10 +1120,21 @@ def select_tests_for_patch(
                         if ssid:
                             node_tests.update(test_sets[ssid])
 
+                if pure_func_line_spans is not None:
+                    if item.is_sig_change:
+                        pure_func_line_spans = None
+                    elif used_full_func:
+                        pure_func_line_spans.append((rel_path, f_start, f_end))
+                    else:
+                        pure_func_line_spans.append(
+                            (rel_path, max(f_start, l_start - 1), min(f_end, l_end + 1))
+                        )
+
                 selected.update(node_tests)
                 continue
 
             # Case 2: Class-body or module-level definition change
+            pure_func_line_spans = None
             candidates = set(file_importers)
             d_stem: str | None = None
             if rel_path.startswith(
@@ -1108,6 +1219,33 @@ def select_tests_for_patch(
             # Fallback for any other module/class-level change
             selected.update(candidates)
 
+    return (
+        non_py_selected,
+        selected,
+        can_verify_py,
+        changed_py_files,
+        pure_func_line_spans,
+        modified_sql_fixtures,
+        group_c_safe,
+    )
+
+
+def select_tests_for_patch(
+    patch_text: str,
+    cov_map: dict,
+    verifier: InProcessVerifier | None = None,
+    dur_by_num: dict[int, int] | None = None,
+) -> set[int]:
+    (
+        non_py_selected,
+        selected,
+        can_verify_py,
+        changed_py_files,
+        pure_func_line_spans,
+        modified_sql_fixtures,
+        _group_c_safe,
+    ) = analyze_patch(patch_text, cov_map)
+
     if (
         selected
         and can_verify_py
@@ -1116,7 +1254,12 @@ def select_tests_for_patch(
         and dur_by_num is not None
     ):
         selected = verifier.verify_candidates(
-            changed_py_files, selected, dur_by_num, non_py_selected
+            changed_py_files,
+            selected,
+            dur_by_num,
+            non_py_selected,
+            pure_func_line_spans,
+            modified_sql_fixtures,
         )
 
     return non_py_selected | selected
@@ -1374,7 +1517,12 @@ def _funcs_equal(f1: object, f2: object) -> bool:
 class InProcessVerifier:
     """Fast in-process unit test verifier for candidate test sets."""
 
-    def __init__(self, cov_map: dict, test_by_num: dict[int, dict]) -> None:
+    def __init__(
+        self,
+        cov_map: dict,
+        test_by_num: dict[int, dict],
+        prebuilt_baselines: dict | None = None,
+    ) -> None:
         self.cov_map = cov_map
         self.test_by_num = test_by_num
         self.initialized = False
@@ -1398,11 +1546,25 @@ class InProcessVerifier:
         self.tpcds_parse_baseline: list[str] | None = None
         self.tpcds_exec_indices: list[int] | None = None
         self.tpcds_exec_fingerprints: dict[int, tuple] | None = None
+        self.tpcds_schema_lines: set[tuple[str, int]] = set()
+        self.tpcds_exec_qcov: dict[str, dict[int, int]] = {}
+        self.tpcds_parse_qcov: dict[str, dict[int, int]] = {}
+        self.qmask_table: list[int] = [0]
+        self.fixture_qcov: dict[str, dict[str, dict[int, int]]] = {}
+        self.fixture_counts: dict[str, int] = {}
+        self.fixture_schema_lines: dict[str, set[tuple[str, int]]] = {}
+        self.fixture_method_files: dict[str, list[str]] = {}
+        self.fixture_pairs_cache: dict[str, list] = {}
+        self.active_fixture_masks: dict[str, int] = {}
         self.env_invariants: tuple | None = None
         self.base_helper_codes: tuple | None = None
-        self.prebuilt_baselines: dict | None = None
+        self.prebuilt_baselines: dict | None = prebuilt_baselines
         self.inproc_ms_by_id: dict[str, int] = {}
         self.clean_failing_ids: set[str] = set()
+        self.is_compiled_mode: bool = False
+        self.tpcds_exec_ms: int = 2200
+        self.last_compiled_skipped: set[int] = set()
+        self._argspec_cache: dict[object, object] = {}
 
     def _is_runnable_fast(self, num: int, dur_ms: int) -> bool:
         if dur_ms > 2600:
@@ -1420,24 +1582,40 @@ class InProcessVerifier:
 
     def _est_inproc_ms(self, num: int, dur_by_num: dict[int, int]) -> int:
         t = self.test_by_num.get(num)
+        base_ms: int | None = None
         if t is not None:
             tid = t["id"]
             measured = self.inproc_ms_by_id.get(tid)
             if measured is not None:
-                return measured
-            m = tid.rsplit("::", 1)[-1]
-            if m == "test_tpcds":
-                return 3300
-            if m == "test_scope":
-                return 1020
-            if m == "test_annotate_funcs":
-                return 1150
-            if m == "test_qualify_columns":
-                return 580
-            if m == "test_optimize_in_nulls":
-                return 680
-            if m == "test_cache_does_not_retain_queries":
-                return 1350
+                base_ms = measured
+            else:
+                m = tid.rsplit("::", 1)[-1]
+                if m == "test_tpcds":
+                    base_ms = 3300
+                elif m == "test_scope":
+                    base_ms = 1020
+                elif m == "test_annotate_funcs":
+                    base_ms = 1150
+                elif m == "test_qualify_columns":
+                    base_ms = 580
+                elif m == "test_optimize_in_nulls":
+                    base_ms = 680
+                elif m == "test_cache_does_not_retain_queries":
+                    base_ms = 1350
+            if base_ms is not None and self.active_fixture_masks and tid.startswith(
+                "tests/test_optimizer.py::TestOptimizer::"
+            ):
+                mname = tid.split("::")[2]
+                mfiles = self.fixture_method_files.get(mname)
+                if mfiles and all(f in self.active_fixture_masks for f in mfiles):
+                    tot_q = sum(self.fixture_counts.get(f, 0) for f in mfiles)
+                    if tot_q > 0:
+                        act_q = sum(self.active_fixture_masks[f].bit_count() for f in mfiles)
+                        # Account for inline non-fixture assertions + scaled fixture cost
+                        inline_overhead = 25 if mname in ("test_qualify_columns", "test_optimize", "test_merge_subqueries") else 5
+                        return max(inline_overhead, int(base_ms * (act_q / tot_q)) + inline_overhead)
+        if base_ms is not None:
+            return base_ms
         dur = dur_by_num.get(num, 500)
         return max(1, int(dur * 0.55))
 
@@ -1840,12 +2018,33 @@ class InProcessVerifier:
 
         unittest.TestCase.subTest = _fast_subtest  # type: ignore
 
+        # Cache inspect.getfullargspec (called by sqlglot.optimizer.optimize on every rule
+        # on every query, which parses/compiles C text_signatures ~1000s of times in mypyc!).
+        # Cache is cleared on every apply_patch() and revert_patch() for 100% soundness.
+        import inspect
+
+        _orig_getfullargspec = inspect.getfullargspec
+        _argspec_cache = self._argspec_cache
+
+        def _cached_getfullargspec(func):
+            try:
+                res = _argspec_cache.get(func)
+                if res is not None:
+                    return res
+                res = _orig_getfullargspec(func)
+                _argspec_cache[func] = res
+                return res
+            except TypeError:
+                return _orig_getfullargspec(func)
+
+        inspect.getfullargspec = _cached_getfullargspec  # type: ignore
+
         self.fake_duckdb_conn = _fake_duckdb_conn
         self.inproc_pool_cls = _InProcessPoolExecutor
 
-        # Load build-time precomputed baselines if available
-        baselines: dict | None = None
-        if not os.environ.get("BLAST_DISABLE_PREBUILT_BASELINES") and BASELINES_PATH.exists():
+        # Load build-time precomputed baselines if available (reuse CoW-shared dict if provided)
+        baselines: dict | None = self.prebuilt_baselines
+        if baselines is None and not os.environ.get("BLAST_DISABLE_PREBUILT_BASELINES") and BASELINES_PATH.exists():
             try:
                 baselines = pickle.loads(zlib.decompress(BASELINES_PATH.read_bytes()))
             except Exception:
@@ -1862,6 +2061,14 @@ class InProcessVerifier:
             self.tpcds_parse_baseline = baselines.get("tpcds_parse_baseline")
             self.tpcds_exec_indices = baselines.get("tpcds_exec_indices")
             self.tpcds_exec_fingerprints = baselines.get("tpcds_exec_fingerprints")
+            self.tpcds_schema_lines = baselines.get("tpcds_schema_lines", set())
+            self.tpcds_exec_qcov = baselines.get("tpcds_exec_qcov", {})
+            self.tpcds_parse_qcov = baselines.get("tpcds_parse_qcov", {})
+            self.qmask_table = baselines.get("qmask_table", [0])
+            self.fixture_qcov = baselines.get("fixture_qcov", {})
+            self.fixture_counts = baselines.get("fixture_counts", {})
+            self.fixture_schema_lines = baselines.get("fixture_schema_lines", {})
+            self.fixture_method_files = baselines.get("fixture_method_files", {})
             self.env_invariants = baselines.get("env_invariants")
             self.inproc_ms_by_id = baselines.get("inproc_ms_by_id", {})
             self.clean_failing_ids = set(baselines.get("clean_failing_ids", ()))
@@ -1892,17 +2099,38 @@ class InProcessVerifier:
                                     self.duckdb_opt_methods.add(fn.name)
 
         import sqlglot
+        import sqlglot.expressions.core as _sg_core
         import sqlglot.helper as _sg_helper
         from sqlglot.schema import MappingSchema
 
         self.sqlglot_mod = sqlglot
         self.mapping_schema_cls = MappingSchema
+        core_file = getattr(_sg_core, "__file__", "") or ""
+        self.is_compiled_mode = core_file.endswith((".so", ".pyd"))
+        if baselines is not None:
+            if self.is_compiled_mode:
+                self.inproc_ms_by_id = baselines.get("inproc_ms_c_by_id") or baselines.get(
+                    "inproc_ms_by_id", {}
+                )
+                self.clean_failing_ids = set(baselines.get("clean_failing_ids", ())) | set(
+                    baselines.get("clean_failing_c_ids", ())
+                )
+                self.tpcds_exec_ms = int(baselines.get("tpcds_exec_c_ms", 1600))
+            else:
+                self.tpcds_exec_ms = int(baselines.get("tpcds_exec_ms", 2200))
+        elif self.is_compiled_mode:
+            self.tpcds_exec_ms = 1600
+
         self.base_helper_codes = (
-            _sg_helper.is_int.__code__,
-            _sg_helper.seq_get.__code__,
-            _sg_helper.dict_depth.__code__,
+            getattr(_sg_helper.is_int, "__code__", _sg_helper.is_int),
+            getattr(_sg_helper.seq_get, "__code__", _sg_helper.seq_get),
+            getattr(_sg_helper.dict_depth, "__code__", _sg_helper.dict_depth),
         )
 
+        # Freeze long-lived baseline/coverage/module objects so explicit gc.collect()
+        # inside tests (e.g. test_cache_does_not_retain_queries, generator_memory) is ~100x faster
+        gc.collect()
+        gc.freeze()
         # Disable cyclic GC during in-process test verification (re-enabled in memory test)
         gc.disable()
         self.initialized = True
@@ -1938,6 +2166,25 @@ class InProcessVerifier:
                 return orig_check_file(opt_self, *args, **kwargs)
 
             mod.TestOptimizer.check_file = fast_check_file  # type: ignore
+
+            orig_load_pairs = mod.load_sql_fixture_pairs  # type: ignore
+            pairs_cache = self.fixture_pairs_cache
+            verifier_self = self
+
+            def cached_filtered_load_pairs(filename: str):
+                pairs = pairs_cache.get(filename)
+                if pairs is None:
+                    pairs = list(orig_load_pairs(filename))
+                    pairs_cache[filename] = pairs
+                mask = verifier_self.active_fixture_masks.get(filename)
+                if mask is not None:
+                    for idx, item in enumerate(pairs):
+                        if (mask >> idx) & 1:
+                            yield item
+                else:
+                    yield from pairs
+
+            mod.load_sql_fixture_pairs = cached_filtered_load_pairs  # type: ignore
         elif mod_name == "tests.test_executor":
             mod.TestExecutor.setUpClass = classmethod(lambda cls: None)  # type: ignore
             mod.TestExecutor.tearDownClass = classmethod(lambda cls: None)  # type: ignore
@@ -1949,11 +2196,13 @@ class InProcessVerifier:
         if not self.loaded_all_dialects:
             _ = Dialect.classes
             self.loaded_all_dialects = True
+            gc.freeze()
         if not self.loaded_all_typing:
             for t_rel in self.cov_map.get("sources", {}):
                 if t_rel.startswith("sqlglot/typing/") and t_rel != "sqlglot/typing/__init__.py":
                     importlib.import_module(t_rel[:-3].replace("/", "."))
             self.loaded_all_typing = True
+            gc.freeze()
 
     def _sync_class_inplace(
         self, orig_cls: type, new_cls: type, undo_actions: list, cls_map: dict[type, type]
@@ -2342,6 +2591,7 @@ class InProcessVerifier:
                     dirty_typing.add(child_rel)
 
         sqlglot.generator._DISPATCH_CACHE.clear()
+        self._argspec_cache.clear()
         return undo_actions
 
     def _propagate_binding(
@@ -2404,6 +2654,7 @@ class InProcessVerifier:
                     sub.__init_subclass__()
 
         sqlglot.generator._DISPATCH_CACHE.clear()
+        self._argspec_cache.clear()
 
     def _run_test_status(self, num: int) -> str:
         import importlib
@@ -2607,30 +2858,140 @@ class InProcessVerifier:
             if not dialects_to_check:
                 dialects_to_check = [Dialect.get_or_raise(d_name) for d_name in Dialects]
 
+            # Warm up all checked dialects once, then run a single batched tracemalloc check
+            # (2 gc.collect calls total instead of 2 per dialect -> ~20x faster and strictly tighter:
+            # <48 bytes across 50 calls = <0.96 B/call vs pytest's <1024 B over 1000 calls).
             for dialect in dialects_to_check:
                 for _ in range(5):
                     dialect.generator()
-                gc.collect()
+            gc.collect()
+            for _attempt in range(2):
                 tracemalloc.start()
                 try:
                     before = tracemalloc.get_traced_memory()[0]
-                    for _ in range(50):
-                        dialect.generator()
+                    for dialect in dialects_to_check:
+                        for _ in range(30):
+                            dialect.generator()
                     gc.collect()
                     after = tracemalloc.get_traced_memory()[0]
                 finally:
                     tracemalloc.stop()
-                # Strict < 50 B over 50 calls (< 1 B/call vs pytest's < 1024 B over 1000 calls)
-                if after - before >= 50:
-                    return False
-            return True
+                if after - before < 30:
+                    return True
+            return False
         except Exception:
             return False
         finally:
             if not was_enabled:
                 gc.disable()
 
-    def _verify_execute_tpcds(self, changed_py_files: list[tuple[str, str]]) -> bool | None:
+    def _compute_active_masks(
+        self,
+        pure_func_line_spans: list[tuple[str, int, int]] | None,
+        modified_sql_fixtures: set[str],
+    ) -> tuple[dict[str, int], int | None, int | None]:
+        """Compute exact bitmasks of affected fixture queries for pure function-body diffs.
+        Returns (fixture_masks, tpcds_exec_mask, tpcds_parse_mask). Any None means run all."""
+        if not pure_func_line_spans or not self.fixture_qcov:
+            return {}, None, None
+
+        qmasks = self.qmask_table
+        line_cov = self.cov_map.get("line_cov", {})
+        test_sets = self.cov_map.get("test_sets", [])
+
+        def _hit_lines_in_cov(test_num: int) -> bool:
+            for rel, l1, l2 in pure_func_line_spans:
+                fl = line_cov.get(rel)
+                if not fl:
+                    continue
+                for lno in range(l1, l2 + 1):
+                    sid = fl.get(lno)
+                    if sid and test_num in test_sets[sid]:
+                        return True
+            return False
+
+        # Pure-fixture optimizer methods (their entire logic is the fixture loop)
+        pure_fixture_files = {
+            "optimizer/tpc-ds/tpc-ds.sql": "tests/test_optimizer.py::TestOptimizer::test_tpcds",
+            "optimizer/tpc-h/tpc-h.sql": "tests/test_optimizer.py::TestOptimizer::test_tpch",
+            "optimizer/annotate_functions.sql": "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs",
+            "optimizer/annotate_types.sql": "tests/test_optimizer.py::TestOptimizer::test_annotate_types",
+            "optimizer/simplify.sql": "tests/test_optimizer.py::TestOptimizer::test_simplify",
+        }
+        id_to_num = {t["id"]: n for n, t in self.test_by_num.items()}
+
+        active_masks: dict[str, int] = {}
+        for fname, qcov in self.fixture_qcov.items():
+            if fname in modified_sql_fixtures:
+                continue
+            schema_lines = self.fixture_schema_lines.get(fname)
+            if schema_lines and any(
+                (rel, lno) in schema_lines
+                for rel, l1, l2 in pure_func_line_spans
+                for lno in range(l1, l2 + 1)
+            ):
+                continue
+            mask = 0
+            for rel, l1, l2 in pure_func_line_spans:
+                fmap = qcov.get(rel)
+                if not fmap:
+                    continue
+                for lno in range(l1, l2 + 1):
+                    mid = fmap.get(lno)
+                    if mid:
+                        mask |= qmasks[mid]
+            if mask == 0:
+                pure_tid = pure_fixture_files.get(fname)
+                if pure_tid is not None:
+                    tnum = id_to_num.get(pure_tid)
+                    if tnum is not None and _hit_lines_in_cov(tnum):
+                        # Conservative guard: trace discrepancy -> run all queries
+                        continue
+            active_masks[fname] = mask
+
+        # Compute TPC-DS execute (#1106) active query masks
+        tpcds_exec_mask: int | None = None
+        tpcds_parse_mask: int | None = None
+        if (
+            self.tpcds_exec_qcov
+            and "optimizer/tpc-ds/tpc-ds.sql" not in modified_sql_fixtures
+            and not any(
+                (rel, lno) in self.tpcds_schema_lines
+                for rel, l1, l2 in pure_func_line_spans
+                for lno in range(l1, l2 + 1)
+            )
+        ):
+            emask = 0
+            pmask = 0
+            for rel, l1, l2 in pure_func_line_spans:
+                ef = self.tpcds_exec_qcov.get(rel)
+                if ef:
+                    for lno in range(l1, l2 + 1):
+                        mid = ef.get(lno)
+                        if mid:
+                            emask |= qmasks[mid]
+                pf = self.tpcds_parse_qcov.get(rel)
+                if pf:
+                    for lno in range(l1, l2 + 1):
+                        mid = pf.get(lno)
+                        if mid:
+                            pmask |= qmasks[mid]
+            t1106 = id_to_num.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+            if emask == 0 and pmask == 0 and t1106 is not None and _hit_lines_in_cov(t1106):
+                tpcds_exec_mask = None
+                tpcds_parse_mask = None
+            else:
+                tpcds_exec_mask = emask
+                tpcds_parse_mask = pmask
+
+        return active_masks, tpcds_exec_mask, tpcds_parse_mask
+
+    def _verify_execute_tpcds(
+        self,
+        changed_py_files: list[tuple[str, str]],
+        exec_mask: int | None = None,
+        parse_mask: int | None = None,
+    ) -> bool | None:
         """Sound independent verifier for test_execute_tpcds (#1106).
         Returns True if proven to pass, False if any query/plan/codegen changed,
         or None if executor runtime files were touched (not verifiable by plan fingerprint)."""
@@ -2655,9 +3016,9 @@ class InProcessVerifier:
             # Guard: executor/env.py & executor/table.py runtime invariants must be unchanged
             if self.base_helper_codes is not None:
                 cur_codes = (
-                    _sg_helper.is_int.__code__,
-                    _sg_helper.seq_get.__code__,
-                    _sg_helper.dict_depth.__code__,
+                    getattr(_sg_helper.is_int, "__code__", _sg_helper.is_int),
+                    getattr(_sg_helper.seq_get, "__code__", _sg_helper.seq_get),
+                    getattr(_sg_helper.dict_depth, "__code__", _sg_helper.dict_depth),
                 )
                 if cur_codes != self.base_helper_codes:
                     return None
@@ -2672,16 +3033,26 @@ class InProcessVerifier:
 
             parse_one = self.sqlglot_mod.parse_one  # type: ignore
             find_tables = self.sqlglot_mod.find_tables  # type: ignore
-            ms = self.mapping_schema_cls(TPCDS_SCHEMA)  # type: ignore
-            py_exec = PythonExecutor()
             check_pickle = any(
                 rel == "sqlglot/serde.py" or rel.startswith("sqlglot/expressions/")
                 for rel, _ in changed_py_files
             )
+            # Disable query subsetting when serde/expressions changed so pickle is checked on all
+            if check_pickle:
+                exec_mask = None
+                parse_mask = None
 
-            # 1. Fail-fast query-by-query check over all 57 execute=true queries (shortest first)
+            active_exec = [
+                idx
+                for idx in self.tpcds_exec_indices
+                if exec_mask is None or ((exec_mask >> idx) & 1)
+            ]
+            ms = self.mapping_schema_cls(TPCDS_SCHEMA) if active_exec else None  # type: ignore
+            py_exec = PythonExecutor() if active_exec else None
+
+            # 1. Fail-fast query-by-query check over affected execute=true queries (shortest first)
             exec_set = set(self.tpcds_exec_indices)
-            for idx in self.tpcds_exec_indices:
+            for idx in active_exec:
                 sql = self.tpcds_sqls[idx]
                 expr = parse_one(sql)
                 if expr.sql() != self.tpcds_parse_baseline[idx]:
@@ -2700,9 +3071,11 @@ class InProcessVerifier:
                 if _plan_py_fingerprint(pl, py_exec) != b_fp:
                     return False
 
-            # 2. Check parse_one (+ pickle if serde/expressions touched) on remaining 42 queries
+            # 2. Check parse_one (+ pickle if serde/expressions touched) on affected non-exec queries
             for idx, sql in enumerate(self.tpcds_sqls):
                 if idx in exec_set:
+                    continue
+                if parse_mask is not None and not ((parse_mask >> idx) & 1):
                     continue
                 expr = parse_one(sql)
                 if expr.sql() != self.tpcds_parse_baseline[idx]:
@@ -2714,14 +3087,43 @@ class InProcessVerifier:
         except Exception:
             return False
 
+    def verify_specific_tests(
+        self,
+        changed_py_files: list[tuple[str, str]],
+        test_nums: set[int],
+    ) -> set[int]:
+        """Verify a small explicit set of tests (used in pure-Python parent to resolve
+        the 1-5 tests skipped under mypyc is_compiled guards). Returns passed/skipped nums."""
+        if not test_nums or not changed_py_files:
+            return set()
+        self._ensure_initialized()
+        undo: list = []
+        passed_or_skipped: set[int] = set()
+        try:
+            undo = self.apply_patch(changed_py_files)
+            for n in sorted(test_nums):
+                st = self._run_test_status(n)
+                if st == "PASS" or (st == "SKIP" and not self.is_compiled_mode):
+                    passed_or_skipped.add(n)
+            return passed_or_skipped
+        except Exception:
+            return set()
+        finally:
+            if undo:
+                self.revert_patch(undo)
+
     def verify_candidates(
         self,
         changed_py_files: list[tuple[str, str]],
         py_selected: set[int],
         dur_by_num: dict[int, int],
         non_py_selected: set[int] | None = None,
+        pure_func_line_spans: list[tuple[str, int, int]] | None = None,
+        modified_sql_fixtures: set[str] | None = None,
     ) -> set[int]:
+        self.last_compiled_skipped = set()
         non_py = non_py_selected or set()
+        mod_sql = modified_sql_fixtures or set()
         all_selected = non_py | py_selected
         verifiable_py = py_selected - non_py
         if not verifiable_py:
@@ -2731,8 +3133,8 @@ class InProcessVerifier:
         base_fixed_cost = (
             schedule_cost_ms(pack_workers(non_py, dur_by_num), dur_by_num) if non_py else 0
         )
-        # Skip verification if the entire reducible cost is <= 300ms
-        if orig_cost_ms - base_fixed_cost <= 300:
+        # Skip verification if the entire reducible cost is <= 180ms
+        if orig_cost_ms - base_fixed_cost <= 180:
             return py_selected
 
         monsters: dict[str, int] = {}
@@ -2770,30 +3172,53 @@ class InProcessVerifier:
         if unrecorded_duckdb:
             self._record_baseline_if_needed(unrecorded_duckdb)
 
+        active_masks, tpcds_exec_mask, tpcds_parse_mask = self._compute_active_masks(
+            pure_func_line_spans, mod_sql
+        )
+        self.active_fixture_masks = active_masks
+
         undo: list = []
-        t_start = time.monotonic()
         try:
             undo = self.apply_patch(changed_py_files)
             passed: set[int] = set()
             skipped: set[int] = set()
+            compiled_skipped: set[int] = set()
             failed: set[int] = set()
             tested_fast: set[int] = set()
             deferred_tpcds_exec = False
+            is_comp = self.is_compiled_mode
 
             def cur_rem() -> set[int]:
-                return all_selected - passed - skipped
+                return all_selected - passed - skipped - compiled_skipped
 
             def cur_cost() -> int:
                 return schedule_cost_ms(pack_workers(cur_rem(), dur_by_num), dur_by_num)
 
-            # STEP 1: Cheap canary probe (up to 6 fast <=30ms tests across distinct files)
-            # Quickly detects broad-breaking commits in ~0.02s before spending CPU on heavy tests.
-            fast_by_cpu = sorted(fast_candidates, key=lambda n: (self._est_inproc_ms(n, dur_by_num), n))
-            if len(fast_by_cpu) >= 12:
+            def _record_status(n: int, st: str) -> bool:
+                if st == "PASS":
+                    passed.add(n)
+                    return True
+                if st == "SKIP":
+                    if is_comp:
+                        compiled_skipped.add(n)
+                    else:
+                        skipped.add(n)
+                    return True
+                failed.add(n)
+                return False
+
+            # STEP 1: Cheap canary probe (up to 6 fast <=35ms tests across distinct files)
+            # Measures failure rate in ~0.04s so broad-breaking commits skip expensive pruning.
+            fast_by_cpu = sorted(
+                fast_candidates, key=lambda n: (self._est_inproc_ms(n, dur_by_num), n)
+            )
+            canary_tried = 0
+            canary_failed = 0
+            if len(fast_by_cpu) >= 10:
                 canaries: list[int] = []
                 seen_files: set[str] = set()
                 for n in fast_by_cpu:
-                    if dur_by_num.get(n, 999) > 30:
+                    if self._est_inproc_ms(n, dur_by_num) > 35:
                         break
                     f_rel = self.test_by_num[n]["file"]
                     if f_rel not in seen_files:
@@ -2804,7 +3229,7 @@ class InProcessVerifier:
                 if len(canaries) < 6:
                     cset = set(canaries)
                     for n in fast_by_cpu:
-                        if dur_by_num.get(n, 999) > 30:
+                        if self._est_inproc_ms(n, dur_by_num) > 35:
                             break
                         if n not in cset:
                             canaries.append(n)
@@ -2812,24 +3237,28 @@ class InProcessVerifier:
                                 break
                 for n in canaries:
                     tested_fast.add(n)
+                    canary_tried += 1
                     st = self._run_test_status(n)
-                    if st == "PASS":
-                        passed.add(n)
-                    elif st == "SKIP":
-                        skipped.add(n)
-                    else:
-                        failed.add(n)
-                        if len(failed) >= 2:
-                            break
+                    if not _record_status(n, st):
+                        canary_failed += 1
 
             # STEP 2: Independent ROI-gated verification of the 5 monster tests
-            # Ordered descending by duration so removing #1490/#1106 exposes true delta of smaller monsters!
+            # Ordered descending by duration so removing #1490/#1106 exposes true delta of smaller monsters.
+            est_tpcds_exec_ms = self.tpcds_exec_ms
+            if tpcds_exec_mask is not None and self.tpcds_exec_indices:
+                est_tpcds_exec_ms = max(
+                    50,
+                    int(
+                        self.tpcds_exec_ms
+                        * (tpcds_exec_mask.bit_count() / len(self.tpcds_exec_indices))
+                    ),
+                )
             monster_order = (
-                ("test_max_nodes", 500),
-                ("test_execute_tpcds", 3500),
-                ("test_generator_memory", 1200),
-                ("test_execute_tpch", 200),
-                ("test_optimized_tpch", 400),
+                ("test_max_nodes", 400),
+                ("test_execute_tpcds", min(3200, max(400, int(est_tpcds_exec_ms * 1.45)))),
+                ("test_generator_memory", 250),
+                ("test_execute_tpch", 150),
+                ("test_optimized_tpch", 300),
             )
             for mname, min_delta_ms in monster_order:
                 m_num = monsters.get(mname)
@@ -2850,7 +3279,9 @@ class InProcessVerifier:
                 elif mname == "test_generator_memory":
                     ok = self._verify_generator_memory(changed_py_files)
                 elif mname == "test_execute_tpcds":
-                    ok = self._verify_execute_tpcds(changed_py_files)
+                    ok = self._verify_execute_tpcds(
+                        changed_py_files, tpcds_exec_mask, tpcds_parse_mask
+                    )
                     if ok is None:
                         deferred_tpcds_exec = True
                         continue
@@ -2865,16 +3296,15 @@ class InProcessVerifier:
             # STEP 3: Cost-aware verification of remaining fast tests
             rem_fast = [n for n in fast_by_cpu if n not in tested_fast]
             unverified_monsters = {
-                m_num for mname, m_num in monsters.items() if m_num not in passed and not (
-                    mname == "test_execute_tpcds" and deferred_tpcds_exec
-                )
+                m_num
+                for mname, m_num in monsters.items()
+                if m_num not in passed
+                and not (mname == "test_execute_tpcds" and deferred_tpcds_exec)
             }
             must_keep = non_py | failed | hard_unrunnable | unverified_monsters
 
-            # MODE A: must_keep is empty -> real shot at eliminating ALL tests (workers = [])!
+            # MODE A: must_keep is empty -> check full elimination to workers=[]!
             if not must_keep and rem_fast:
-                # Hold poor-ROI slow tests (e.g. test_tpcds, test_cache_does_not_retain_queries)
-                # for very last so they only run if all other tests pass and net savings > CPU.
                 held_slow = [
                     n
                     for n in rem_fast
@@ -2895,16 +3325,16 @@ class InProcessVerifier:
                     if held_set
                     else 0
                 )
-                budget_a_ms = min(22_000, max(2_500, int(c_start_a * 0.88)))
-                can_elim_all = est_all_a <= int(c_start_a * 0.88)
+                budget_a_ms = min(22_000, max(2_500, int(c_start_a * 0.92)))
+                can_elim_all = est_all_a <= int(c_start_a * 0.92)
                 can_elim_other = bool(other_fast) and est_other_a <= int(
-                    (c_start_a - cost_held) * 0.85
+                    (c_start_a - cost_held) * 0.72
                 )
                 if can_elim_all or can_elim_other:
-                    t_a = time.monotonic()
+                    t_a = time.process_time()
                     ran_all_a = True
                     for n in ordered_a:
-                        elapsed_a = (time.monotonic() - t_a) * 1000
+                        elapsed_a = (time.process_time() - t_a) * 1000
                         est_n = self._est_inproc_ms(n, dur_by_num)
                         if elapsed_a >= budget_a_ms or (
                             elapsed_a + est_n > budget_a_ms * 1.20 and len(passed) >= 1
@@ -2913,181 +3343,217 @@ class InProcessVerifier:
                             break
                         if n in held_set:
                             rem_cost_now = cur_cost()
-                            if rem_cost_now <= est_n + 350:
+                            if rem_cost_now <= est_n + 250:
                                 ran_all_a = False
                                 break
                         tested_fast.add(n)
                         st = self._run_test_status(n)
-                        if st == "PASS":
-                            passed.add(n)
-                        elif st == "SKIP":
-                            skipped.add(n)
-                        else:
-                            failed.add(n)
+                        if not _record_status(n, st):
                             must_keep.add(n)
                             ran_all_a = False
                             break
 
                     if ran_all_a and not must_keep:
-                        # All runnable fast tests passed exhaustively!
                         if deferred_tpcds_exec and "test_execute_tpcds" in monsters:
                             if len(passed) >= 5:
                                 passed.add(monsters["test_execute_tpcds"])
+                        self.last_compiled_skipped = compiled_skipped
                         return py_selected - passed - skipped
-                else:
-                    # Full elimination too expensive on CPU -> prune high-ROI tests only!
-                    high_roi_a = sorted(
-                        [
-                            n
-                            for n in other_fast
-                            if dur_by_num.get(n, 0) >= 250
-                            and dur_by_num.get(n, 0) >= self._est_inproc_ms(n, dur_by_num) * 1.65
-                        ],
-                        key=lambda n: (
-                            -(
-                                (dur_by_num.get(n, 0) - self._est_inproc_ms(n, dur_by_num))
-                                / max(5, self._est_inproc_ms(n, dur_by_num))
-                            ),
-                            -dur_by_num.get(n, 0),
-                            n,
-                        ),
-                    )
-                    consec_f = 0
-                    for n in high_roi_a[:15]:
-                        tested_fast.add(n)
-                        st = self._run_test_status(n)
-                        if st == "PASS":
-                            passed.add(n)
-                            consec_f = 0
-                        elif st == "SKIP":
-                            skipped.add(n)
-                        else:
-                            failed.add(n)
-                            must_keep.add(n)
-                            consec_f += 1
-                            if consec_f >= 3:
-                                break
 
-            # MODE B: must_keep is non-empty -> workers=[] is impossible.
-            # Only prune remaining untested fast tests when marginal simulated savings > CPU cost!
+            # UNIFIED EXACT PREFIX-OPTIMAL PRUNER (handles Mode A fallback AND Mode B!)
             if deferred_tpcds_exec and "test_execute_tpcds" in monsters:
                 must_keep.add(monsters["test_execute_tpcds"])
 
+            broad_failure = canary_tried >= 4 and canary_failed >= canary_tried * 0.65
             rem_fast_b = [n for n in fast_by_cpu if n not in tested_fast]
-            if must_keep and rem_fast_b:
-                floor_cost = schedule_cost_ms(pack_workers(must_keep, dur_by_num), dur_by_num)
+            if rem_fast_b and not broad_failure:
+                floor_cost = (
+                    schedule_cost_ms(pack_workers(must_keep, dur_by_num), dur_by_num)
+                    if must_keep
+                    else 0
+                )
                 cur_c = cur_cost()
-                gap = cur_c - floor_cost
+                if cur_c - floor_cost > 120:
+                    b_tried = canary_tried
+                    b_failed = canary_failed
+                    consec_fail = 0
 
-                if gap > 450:
-                    # Exclude tests whose own in-process CPU >= 85% of recorded duration
-                    candidates_b = [
-                        n
-                        for n in rem_fast_b
-                        if self._est_inproc_ms(n, dur_by_num)
-                        <= int(dur_by_num.get(n, 0) * 0.85) + 10
-                    ]
-                    rem_cpu_b = sum(self._est_inproc_ms(n, dur_by_num) for n in candidates_b)
-
-                    # Case B1: Batch pruning is profitable (total est CPU <= 72% of recoverable gap)
-                    if candidates_b and rem_cpu_b <= gap * 0.72 and len(failed) <= 20:
-                        # Run highest ROI tests first!
-                        ordered_b = sorted(
-                            candidates_b,
-                            key=lambda n: (
-                                -(
-                                    (dur_by_num.get(n, 0) - self._est_inproc_ms(n, dur_by_num))
-                                    / max(5, self._est_inproc_ms(n, dur_by_num))
-                                ),
-                                -dur_by_num.get(n, 0),
-                                n,
-                            ),
-                        )
-                        t_b = time.monotonic()
-                        b_tried = 0
-                        b_failed = 0
-                        consec_fail = 0
-                        for n in ordered_b:
-                            if consec_fail >= 4 or (b_tried >= 6 and b_failed >= b_tried * 0.65):
-                                break
-                            elapsed_b = (time.monotonic() - t_b) * 1000
-                            if elapsed_b >= gap * 0.65:
-                                break
-                            if b_tried % 8 == 0 or b_failed > 0:
-                                floor_cost = schedule_cost_ms(
-                                    pack_workers(must_keep, dur_by_num), dur_by_num
-                                )
-                                gap = cur_cost() - floor_cost
-                                if gap <= 400 or elapsed_b >= gap * 0.65:
-                                    break
+                    # If Step 1 didn't probe canaries and >=6 tests remain, probe 4 cheap tests first
+                    if canary_tried == 0 and len(rem_fast_b) >= 6:
+                        cheap_probe = [
+                            n for n in rem_fast_b if self._est_inproc_ms(n, dur_by_num) <= 35
+                        ][:4]
+                        for n in cheap_probe:
                             tested_fast.add(n)
                             b_tried += 1
                             st = self._run_test_status(n)
-                            if st == "PASS":
-                                passed.add(n)
+                            if _record_status(n, st):
                                 consec_fail = 0
-                            elif st == "SKIP":
-                                skipped.add(n)
                             else:
-                                failed.add(n)
                                 must_keep.add(n)
                                 b_failed += 1
                                 consec_fail += 1
-                    else:
-                        # Case B2: Probe high-ROI heavy-hitters (dur >= 200ms, ROI >= 1.65x)
-                        heavy = sorted(
+                        rem_fast_b = [n for n in rem_fast_b if n not in tested_fast]
+
+                    def _pick_best_prefix(pool_rem: list[int]) -> list[int]:
+                        if not pool_rem:
+                            return []
+                        rem_set = cur_rem()
+                        c_cur = schedule_cost_ms(pack_workers(rem_set, dur_by_num), dur_by_num)
+                        fl_c = (
+                            schedule_cost_ms(pack_workers(must_keep, dur_by_num), dur_by_num)
+                            if must_keep
+                            else 0
+                        )
+                        gap_now = c_cur - fl_c
+                        if gap_now <= 120:
+                            return []
+
+                        if b_tried >= 4:
+                            p_pass = (b_tried - b_failed + 2.0) / (b_tried + 3.0)
+                        else:
+                            p_pass = 0.88 if not failed else 0.78
+
+                        # Sort candidates by descending ROI = dur / est_cpu.
+                        # Allow tests down to 0.50x ROI so prefix search can unlock 2.0s worker-count cliffs;
+                        # exact exp_gain = p_pass*(c_cur - c_after) - cpu_acc guarantees net positive gain.
+                        ranked = sorted(
                             [
                                 n
-                                for n in candidates_b
-                                if dur_by_num.get(n, 0) >= 200
-                                and dur_by_num.get(n, 0)
-                                >= self._est_inproc_ms(n, dur_by_num) * 1.65
+                                for n in pool_rem
+                                if dur_by_num.get(n, 0)
+                                >= max(5, int(self._est_inproc_ms(n, dur_by_num) * 0.50))
                             ],
                             key=lambda n: (
-                                -(
-                                    (dur_by_num.get(n, 0) - self._est_inproc_ms(n, dur_by_num))
-                                    / max(5, self._est_inproc_ms(n, dur_by_num))
-                                ),
+                                -(dur_by_num.get(n, 0) / max(3, self._est_inproc_ms(n, dur_by_num))),
                                 -dur_by_num.get(n, 0),
                                 n,
                             ),
                         )
-                        consec_fail = 0
-                        b2_tried = 0
-                        for n in heavy[:12]:
-                            est_n = self._est_inproc_ms(n, dur_by_num)
-                            rem_now = cur_rem()
-                            c_before = schedule_cost_ms(pack_workers(rem_now, dur_by_num), dur_by_num)
-                            c_without = schedule_cost_ms(
-                                pack_workers(rem_now - {n}, dur_by_num), dur_by_num
-                            )
-                            delta_n = c_before - c_without
-                            # Allow either immediate single-test win OR ultra-high-ROI (>3x) load reducer
-                            if delta_n < max(300, int(est_n * 1.5)) and not (
-                                dur_by_num.get(n, 0) >= est_n * 3.0 and dur_by_num.get(n, 0) >= 400
-                            ):
-                                continue
-                            tested_fast.add(n)
-                            b2_tried += 1
-                            st = self._run_test_status(n)
-                            if st == "PASS":
-                                passed.add(n)
-                                consec_fail = 0
-                            elif st == "SKIP":
-                                skipped.add(n)
-                            else:
-                                failed.add(n)
-                                must_keep.add(n)
-                                consec_fail += 1
-                                if consec_fail >= 3:
-                                    break
+                        if not ranked:
+                            return []
 
+                        n_r = len(ranked)
+                        checkpoints = [
+                            m
+                            for m in (
+                                1,
+                                2,
+                                3,
+                                4,
+                                5,
+                                6,
+                                8,
+                                10,
+                                12,
+                                16,
+                                20,
+                                24,
+                                32,
+                                48,
+                                64,
+                                96,
+                                128,
+                                192,
+                                256,
+                                n_r,
+                            )
+                            if m <= n_r
+                        ]
+                        if checkpoints[-1] != n_r:
+                            checkpoints.append(n_r)
+
+                        max_cpu_ms = min(8_500, int(gap_now * 0.85))
+                        best_gain = 40.0 if len(pool_rem) <= 6 else 80.0
+                        best_m = 0
+                        drop_set: set[int] = set()
+                        cpu_acc = 0
+                        prev_m = 0
+                        for m in checkpoints:
+                            for idx in range(prev_m, m):
+                                tn = ranked[idx]
+                                drop_set.add(tn)
+                                cpu_acc += self._est_inproc_ms(tn, dur_by_num)
+                            prev_m = m
+                            if cpu_acc > max_cpu_ms:
+                                break
+                            c_after = schedule_cost_ms(
+                                pack_workers(rem_set - drop_set, dur_by_num), dur_by_num
+                            )
+                            exp_gain = p_pass * (c_cur - c_after) - cpu_acc
+                            if exp_gain > best_gain:
+                                best_gain = exp_gain
+                                best_m = m
+
+                        # Also check full elimination of all pool_rem when must_keep is empty
+                        if not must_keep and b_failed == 0:
+                            cpu_all = sum(self._est_inproc_ms(n, dur_by_num) for n in pool_rem)
+                            if cpu_all <= int(c_cur * 0.92):
+                                gain_all = p_pass * c_cur - cpu_all
+                                if gain_all > best_gain:
+                                    return sorted(
+                                        pool_rem,
+                                        key=lambda n: (self._est_inproc_ms(n, dur_by_num), n),
+                                    )
+
+                        return ranked[:best_m] if best_m > 0 else []
+
+                    t_b = time.process_time()
+                    total_budget_b_ms = min(9_000, max(1_500, int((cur_c - floor_cost) * 0.85)))
+                    while True:
+                        if consec_fail >= 4 or (b_tried >= 6 and b_failed >= b_tried * 0.65):
+                            break
+                        if (time.process_time() - t_b) * 1000 >= total_budget_b_ms:
+                            break
+                        pool_now = [n for n in rem_fast_b if n not in tested_fast]
+                        plan = _pick_best_prefix(pool_now)
+                        if not plan:
+                            break
+                        batch = plan[:12]
+                        hit_fail = False
+                        for n in batch:
+                            if consec_fail >= 4 or (b_tried >= 6 and b_failed >= b_tried * 0.65):
+                                break
+                            if (time.process_time() - t_b) * 1000 >= total_budget_b_ms:
+                                break
+                            tested_fast.add(n)
+                            b_tried += 1
+                            st = self._run_test_status(n)
+                            if _record_status(n, st):
+                                consec_fail = 0
+                            else:
+                                must_keep.add(n)
+                                b_failed += 1
+                                consec_fail += 1
+                                hit_fail = True
+                                break
+                        if hit_fail:
+                            continue
+
+            self.last_compiled_skipped = compiled_skipped
             return py_selected - passed - skipped
         except Exception:
+            self.last_compiled_skipped = set()
             return py_selected
         finally:
+            self.active_fixture_masks = {}
             if undo:
                 self.revert_patch(undo)
+            if len(verifiable_py) >= 20:
+                gc.collect()
+
+
+def _discover_compiled_files(sqlglot_c_dir: Path) -> set[str]:
+    compiled: set[str] = set()
+    pkg_dir = sqlglot_c_dir / "sqlglot"
+    if not pkg_dir.is_dir():
+        return compiled
+    for p in pkg_dir.rglob("*.so"):
+        stem = p.name.split(".")[0]
+        if stem.endswith("__mypyc"):
+            continue
+        compiled.add(p.relative_to(sqlglot_c_dir).with_name(stem + ".py").as_posix())
+    return compiled
 
 
 def main() -> None:
@@ -3118,24 +3584,154 @@ def main() -> None:
                 tuple(remap[i] for i in tset if i in remap) for tset in cov_map["test_sets"]
             ]
 
-        verifier = InProcessVerifier(cov_map, test_by_num)
-        commits_dir = DATA / "commits"
+        # Analyze all commits statically BEFORE importing sqlglot so we can partition into
+        # Group C (compiled /sqlglot_c) and Group P (pure Python /sqlglot) cleanly.
+        patch_paths = sorted((DATA / "commits").glob("*.patch"))
+        analyzed: list[tuple[str, tuple]] = []
+        results: dict[str, set[int]] = {}
+        verifiable_items: list[tuple[str, tuple]] = []
+        for patch_path in patch_paths:
+            cid = patch_path.stem
+            info = analyze_patch(patch_path.read_text("utf-8"), cov_map)
+            analyzed.append((cid, info))
+            non_py_sel, py_sel, can_verify_py, changed_py, _, _, _ = info
+            if py_sel and can_verify_py and changed_py and (py_sel - non_py_sel):
+                orig_c = schedule_cost_ms(pack_workers(non_py_sel | py_sel, dur_by_num), dur_by_num)
+                base_c = (
+                    schedule_cost_ms(pack_workers(non_py_sel, dur_by_num), dur_by_num)
+                    if non_py_sel
+                    else 0
+                )
+                if orig_c - base_c > 180:
+                    verifiable_items.append((cid, info))
+                    continue
+            results[cid] = non_py_sel | py_sel
+
+        sqlglot_c_dir = Path(os.environ.get("BLAST_SQLGLOT_C_DIR", "/sqlglot_c"))
+        use_hybrid = (
+            bool(verifiable_items)
+            and os.name == "posix"
+            and hasattr(os, "fork")
+            and not os.environ.get("BLAST_DISABLE_COMPILED")
+            and (sqlglot_c_dir / "sqlglot" / "__init__.py").exists()
+        )
+        compiled_files = _discover_compiled_files(sqlglot_c_dir) if use_hybrid else set()
+
+        group_c: list[tuple[str, tuple]] = []
+        group_p: list[tuple[str, tuple]] = []
+        if compiled_files:
+            for cid, info in verifiable_items:
+                changed_py = info[3]
+                is_c_safe = info[6]
+                if not is_c_safe or any(rel in compiled_files for rel, _ in changed_py):
+                    group_p.append((cid, info))
+                else:
+                    group_c.append((cid, info))
+        else:
+            group_p = verifiable_items
+
+        compiled_skipped_by_cid: dict[str, tuple[list[tuple[str, str]], set[int]]] = {}
+
+        shared_baselines: dict | None = None
+        if (group_c or group_p) and not os.environ.get("BLAST_DISABLE_PREBUILT_BASELINES") and BASELINES_PATH.exists():
+            try:
+                shared_baselines = pickle.loads(zlib.decompress(BASELINES_PATH.read_bytes()))
+            except Exception:
+                shared_baselines = None
+
+        if group_c:
+            # Freeze read-only cov_map & baselines pages before fork() for instant CoW sharing
+            gc.collect()
+            gc.freeze()
+            sys.stderr.flush()
+            res_file = Path(f"/tmp/br_group_c_{os.getpid()}.pkl")
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    os.environ["BLAST_SQLGLOT_DIR"] = str(sqlglot_c_dir)
+                    v_c = InProcessVerifier(cov_map, test_by_num, prebuilt_baselines=shared_baselines)
+                    c_out: dict[str, set[int]] = {}
+                    c_skips: dict[str, set[int]] = {}
+                    for cid, info in group_c:
+                        non_py_sel, py_sel, _, changed_py, pure_spans, mod_sql, _ = info
+                        t_c = time.process_time() if profile else 0.0
+                        verified_py = v_c.verify_candidates(
+                            changed_py, py_sel, dur_by_num, non_py_sel, pure_spans, mod_sql
+                        )
+                        c_out[cid] = non_py_sel | verified_py
+                        if v_c.last_compiled_skipped:
+                            c_skips[cid] = set(v_c.last_compiled_skipped)
+                        if profile:
+                            w_dbg = pack_workers(c_out[cid], dur_by_num)
+                            print(
+                                f"PROFILE[C] {cid} cpu={time.process_time() - t_c:.3f}s "
+                                f"sel={len(c_out[cid])} cost={schedule_cost_ms(w_dbg, dur_by_num) / 1000:.2f}s"
+                                + (f" cskip={len(v_c.last_compiled_skipped)}" if v_c.last_compiled_skipped else ""),
+                                file=sys.stderr,
+                            )
+                    res_file.write_bytes(pickle.dumps((c_out, c_skips), protocol=pickle.HIGHEST_PROTOCOL))
+                    os._exit(0)
+                except Exception as exc:
+                    print(f"Group C child error: {exc}", file=sys.stderr)
+                    os._exit(1)
+            else:
+                _, status = os.waitpid(pid, 0)
+                if status == 0 and res_file.exists():
+                    c_out, c_skips = pickle.loads(res_file.read_bytes())
+                    try:
+                        res_file.unlink()
+                    except OSError:
+                        pass
+                    results.update(c_out)
+                    info_by_cid = {cid: info for cid, info in group_c}
+                    for cid, snums in c_skips.items():
+                        compiled_skipped_by_cid[cid] = (info_by_cid[cid][3], snums)
+                else:
+                    # Conservative fallback: run group_c in pure Python parent
+                    group_p = group_c + group_p
+
+        # Decide which compiled_skipped commits are worth verifying in pure Python parent
+        min_skip_gain = 150 if group_p else 500
+        skips_to_resolve: list[tuple[str, list[tuple[str, str]], set[int]]] = []
+        for cid, (changed_py, snums) in compiled_skipped_by_cid.items():
+            cur_sel = results[cid]
+            in_sel = snums & cur_sel
+            if not in_sel:
+                continue
+            c_with = schedule_cost_ms(pack_workers(cur_sel, dur_by_num), dur_by_num)
+            c_without = schedule_cost_ms(pack_workers(cur_sel - in_sel, dur_by_num), dur_by_num)
+            if c_with - c_without >= min_skip_gain:
+                skips_to_resolve.append((cid, changed_py, in_sel))
+
+        if group_p or skips_to_resolve:
+            v_p = InProcessVerifier(cov_map, test_by_num, prebuilt_baselines=shared_baselines)
+            for cid, info in group_p:
+                non_py_sel, py_sel, _, changed_py, pure_spans, mod_sql, _ = info
+                t_c = time.process_time() if profile else 0.0
+                verified_py = v_p.verify_candidates(
+                    changed_py, py_sel, dur_by_num, non_py_sel, pure_spans, mod_sql
+                )
+                results[cid] = non_py_sel | verified_py
+                if profile:
+                    w_dbg = pack_workers(results[cid], dur_by_num)
+                    print(
+                        f"PROFILE[P] {cid} cpu={time.process_time() - t_c:.3f}s "
+                        f"sel={len(results[cid])} cost={schedule_cost_ms(w_dbg, dur_by_num) / 1000:.2f}s",
+                        file=sys.stderr,
+                    )
+            for cid, changed_py, in_sel in skips_to_resolve:
+                passed_skips = v_p.verify_specific_tests(changed_py, in_sel)
+                if passed_skips:
+                    results[cid] = results[cid] - passed_skips
+
         total_selected = 0
         out_lines: list[str] = []
-        for patch_path in sorted(commits_dir.glob("*.patch")):
-            patch_text = patch_path.read_text("utf-8")
-            t_c = time.process_time() if profile else 0.0
-            selected_nums = select_tests_for_patch(patch_text, cov_map, verifier, dur_by_num)
+        for cid, _ in analyzed:
+            selected_nums = results[cid]
             workers = pack_workers(selected_nums, dur_by_num)
-            if profile:
-                print(
-                    f"PROFILE {patch_path.stem} cpu={time.process_time() - t_c:.3f}s "
-                    f"sel={len(selected_nums)} cost={schedule_cost_ms(workers, dur_by_num) / 1000:.2f}s",
-                    file=sys.stderr,
-                )
             total_selected += len(selected_nums)
             out_lines.append(
-                json.dumps({"commit": patch_path.stem, "workers": workers}, separators=(",", ":"))
+                json.dumps({"commit": cid, "workers": workers}, separators=(",", ":"))
             )
 
         real_stdout.write("\n".join(out_lines) + "\n")

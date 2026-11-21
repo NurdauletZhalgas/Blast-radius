@@ -11,6 +11,7 @@ containing:
 from __future__ import annotations
 
 import ast
+import gc
 import hashlib
 import os
 import pathlib
@@ -198,7 +199,52 @@ def main() -> None:
         for sql, opt in tpch_pairs
     ]
 
-    # 5. TPC-DS baselines (for sound independent verification of test_execute_tpcds)
+    # 5. TPC-DS baselines + per-query line coverage (using sys.monitoring)
+    root_prefix = str(SQLGLOT_DIR.resolve()).replace("\\", "/").lower()
+    if not root_prefix.endswith("/"):
+        root_prefix += "/"
+    code_to_rel: dict[object, str] = {}
+
+    def _get_rel(code: object) -> str:
+        r = code_to_rel.get(code)
+        if r is None:
+            fn = getattr(code, "co_filename", "").replace("\\", "/")
+            fl = fn.lower()
+            if fl.startswith(root_prefix + "sqlglot/"):
+                r = fn[len(root_prefix) :]
+            else:
+                r = ""
+            code_to_rel[code] = r
+        return r
+
+    mon = sys.monitoring
+    TOOL_ID = 2
+    DISABLE = mon.DISABLE
+    mon.use_tool_id(TOOL_ID, "qcov_build")
+    cur_lines: set[tuple[str, int]] = set()
+
+    def _on_line(code: object, line: int) -> object:
+        r = _get_rel(code)
+        if r:
+            cur_lines.add((r, line))
+        return DISABLE
+
+    mon.register_callback(TOOL_ID, mon.events.LINE, _on_line)
+
+    qmask_to_id: dict[int, int] = {0: 0}
+    qmask_table: list[int] = [0]
+
+    def _compress_qmap(raw: dict[tuple[str, int], int]) -> dict[str, dict[int, int]]:
+        out: dict[str, dict[int, int]] = {}
+        for (rel, lno), mask in raw.items():
+            mid = qmask_to_id.get(mask)
+            if mid is None:
+                mid = len(qmask_table)
+                qmask_to_id[mask] = mid
+                qmask_table.append(mask)
+            out.setdefault(rel, {})[lno] = mid
+        return out
+
     tpcds_raw = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
     tpcds_sqls = [sql for _, sql, _ in tpcds_raw]
     tpcds_parse_baseline = [parse_one(sql).sql() for sql in tpcds_sqls]
@@ -206,18 +252,184 @@ def main() -> None:
         [i for i, (m, _, _) in enumerate(tpcds_raw) if m.get("execute")],
         key=lambda i: (len(tpcds_sqls[i]), i),
     )
+    tpcds_exec_set = set(tpcds_exec_indices)
+
+    mon.set_events(TOOL_ID, mon.events.LINE)
+    cur_lines.clear()
+    mon.restart_events()
     ms0 = MappingSchema(TPCDS_SCHEMA)
+    tpcds_schema_lines: set[tuple[str, int]] = set(cur_lines)
+
     py_exec0 = PythonExecutor()
     tpcds_exec_fingerprints: dict[int, tuple[str, tuple[str, ...], str, bytes]] = {}
+    raw_tpcds_exec_qcov: dict[tuple[str, int], int] = {}
     for idx in tpcds_exec_indices:
         sql = tpcds_sqls[idx]
+        cur_lines.clear()
+        mon.restart_events()
         expr = parse_one(sql)
         duck_sql = expr.sql(dialect="duckdb")
         tbls = tuple(sorted(t.name for t in find_tables(expr)))
         opt_expr = optimize(expr, ms0, leave_tables_isolated=True)
         pl = Plan(opt_expr)
         fp = plan_py_fingerprint(pl, py_exec0)
+        bit = 1 << idx
+        for k in cur_lines:
+            raw_tpcds_exec_qcov[k] = raw_tpcds_exec_qcov.get(k, 0) | bit
         tpcds_exec_fingerprints[idx] = (duck_sql, tbls, opt_expr.sql(), fp)
+
+    raw_tpcds_parse_qcov: dict[tuple[str, int], int] = {}
+    for idx, sql in enumerate(tpcds_sqls):
+        if idx in tpcds_exec_set:
+            continue
+        cur_lines.clear()
+        mon.restart_events()
+        _ = parse_one(sql).sql()
+        bit = 1 << idx
+        for k in cur_lines:
+            raw_tpcds_parse_qcov[k] = raw_tpcds_parse_qcov.get(k, 0) | bit
+
+    mon.set_events(TOOL_ID, 0)
+
+    # 5b. Trace per-query line coverage for all major TestOptimizer fixture tests
+    import tests.test_optimizer as mod_opt
+
+    verifier._ensure_test_module_patched("tests.test_optimizer", mod_opt)
+    fixture_qcov_raw: dict[str, dict[tuple[str, int], int]] = {}
+    fixture_counts: dict[str, int] = {}
+    fixture_schema_lines: dict[str, set[tuple[str, int]]] = {}
+    fixture_method_files: dict[str, list[str]] = {}
+
+    FIXTURE_METHODS = (
+        "test_tpcds",
+        "test_annotate_funcs",
+        "test_qualify_columns",
+        "test_simplify",
+        "test_optimize",
+        "test_tpch",
+        "test_merge_subqueries",
+        "test_annotate_types",
+        "test_unnest_subqueries",
+        "test_pushdown_predicates",
+        "test_pushdown_projection",
+        "test_eliminate_joins",
+        "test_eliminate_subqueries",
+        "test_normalize",
+        "test_canonicalize",
+        "test_isolate_table_selects",
+        "test_qualify_tables",
+        "test_optimize_joins",
+        "test_eliminate_ctes",
+    )
+
+    orig_check_file_patched = mod_opt.TestOptimizer.check_file
+    orig_load_pairs = mod_opt.load_sql_fixture_pairs
+    active_method: list[str] = [""]
+
+    def _traced_check_file(opt_self, file, func, pretty=False, execute=None, only=None, **kwargs):
+        fname = f"optimizer/{file}.sql"
+        if only is not None:
+            return orig_check_file_patched(
+                opt_self, file, func, pretty=pretty, execute=False, only=only, **kwargs
+            )
+        mname = active_method[0]
+        if mname:
+            flist = fixture_method_files.setdefault(mname, [])
+            if fname not in flist:
+                flist.append(fname)
+        raw_map = fixture_qcov_raw.setdefault(fname, {})
+        schema_set = fixture_schema_lines.setdefault(fname, set())
+        pairs_list = list(orig_load_pairs(fname))
+        fixture_counts[fname] = len(pairs_list)
+
+        if file in ("tpc-ds/tpc-ds", "tpc-h/tpc-h") and isinstance(kwargs.get("schema"), dict):
+            mon.set_events(TOOL_ID, mon.events.LINE)
+            cur_lines.clear()
+            mon.restart_events()
+            kwargs["schema"] = mod_opt.MappingSchema(kwargs["schema"])
+            schema_set.update(cur_lines)
+            mon.set_events(TOOL_ID, 0)
+
+        import json as _json
+        from tests.helpers import string_to_bool as _s2b
+
+        mon.set_events(TOOL_ID, mon.events.LINE)
+        for q_idx, (meta, sql, expected) in enumerate(pairs_list):
+            dialect = meta.get("dialect")
+            leave_tables_isolated = meta.get("leave_tables_isolated")
+            validate_qualify_columns = meta.get("validate_qualify_columns")
+            canonicalize_table_aliases = meta.get("canonicalize_table_aliases")
+            func_kwargs = kwargs.copy()
+            if schema_meta := meta.get("schema"):
+                func_kwargs["schema"] = _json.loads(schema_meta)
+            if leave_tables_isolated is not None:
+                func_kwargs["leave_tables_isolated"] = _s2b(leave_tables_isolated)
+            if validate_qualify_columns is not None:
+                func_kwargs["validate_qualify_columns"] = _s2b(validate_qualify_columns)
+            if dialect:
+                func_kwargs["dialect"] = dialect
+            if canonicalize_table_aliases is not None:
+                func_kwargs["canonicalize_table_aliases"] = _s2b(canonicalize_table_aliases)
+
+            cur_lines.clear()
+            mon.restart_events()
+            optimized = mod_opt.parse_and_optimize(func, sql, dialect, **func_kwargs)
+            actual = optimized.sql(pretty=pretty, dialect=dialect)
+            bit = 1 << q_idx
+            for k in cur_lines:
+                raw_map[k] = raw_map.get(k, 0) | bit
+            opt_self.assertEqual(expected, actual)
+        mon.set_events(TOOL_ID, 0)
+
+    def _traced_load_pairs(filename):
+        mname = active_method[0]
+        if mname not in ("test_annotate_funcs", "test_annotate_types"):
+            yield from orig_load_pairs(filename)
+            return
+        flist = fixture_method_files.setdefault(mname, [])
+        if filename not in flist:
+            flist.append(filename)
+        raw_map = fixture_qcov_raw.setdefault(filename, {})
+        pairs_list = list(orig_load_pairs(filename))
+        fixture_counts[filename] = len(pairs_list)
+        mon.set_events(TOOL_ID, mon.events.LINE)
+        try:
+            for q_idx, item in enumerate(pairs_list):
+                cur_lines.clear()
+                mon.restart_events()
+                yield item
+                bit = 1 << q_idx
+                for k in cur_lines:
+                    raw_map[k] = raw_map.get(k, 0) | bit
+        finally:
+            mon.set_events(TOOL_ID, 0)
+
+    mod_opt.TestOptimizer.check_file = _traced_check_file  # type: ignore
+    mod_opt.load_sql_fixture_pairs = _traced_load_pairs  # type: ignore
+    try:
+        opt_num_by_method = {
+            t["id"].split("::")[2]: num
+            for num, t in test_by_num.items()
+            if t["id"].startswith("tests/test_optimizer.py::TestOptimizer::")
+        }
+        for mname in FIXTURE_METHODS:
+            num = opt_num_by_method.get(mname)
+            if num is None:
+                continue
+            active_method[0] = mname
+            st = verifier._run_test_status(num)
+            if st == "FAIL":
+                raise RuntimeError(f"Fixture trace failed for {mname}")
+    finally:
+        active_method[0] = ""
+        mod_opt.TestOptimizer.check_file = orig_check_file_patched  # type: ignore
+        mod_opt.load_sql_fixture_pairs = orig_load_pairs  # type: ignore
+        mon.set_events(TOOL_ID, 0)
+        mon.free_tool_id(TOOL_ID)
+
+    tpcds_exec_qcov = _compress_qmap(raw_tpcds_exec_qcov)
+    tpcds_parse_qcov = _compress_qmap(raw_tpcds_parse_qcov)
+    fixture_qcov = {fname: _compress_qmap(rmap) for fname, rmap in fixture_qcov_raw.items()}
 
     env_invariants = (
         dict(Generator.TIME_PART_SINGULARS),
@@ -226,6 +438,8 @@ def main() -> None:
     )
 
     # 6. Measure exact in-process CPU time of every runnable test on this container
+    gc.collect()
+    gc.freeze()
     inproc_ms_by_id: dict[str, int] = {}
     clean_failing_ids: set[str] = set()
     for num, t_info in test_by_num.items():
@@ -240,6 +454,17 @@ def main() -> None:
         else:
             inproc_ms_by_id[tid] = dt_ms
 
+    verifier.tpcds_sqls = tpcds_sqls
+    verifier.tpcds_parse_baseline = tpcds_parse_baseline
+    verifier.tpcds_exec_indices = tpcds_exec_indices
+    verifier.tpcds_exec_fingerprints = tpcds_exec_fingerprints
+    verifier.env_invariants = env_invariants
+    t_tpcds = time.process_time()
+    ok_tpcds = verifier._verify_execute_tpcds([])
+    tpcds_exec_ms = max(100, int(round((time.process_time() - t_tpcds) * 1000)))
+    if not ok_tpcds:
+        raise RuntimeError("Clean _verify_execute_tpcds failed during build_baselines")
+
     data = {
         "duckdb_opt_methods": duckdb_opt_methods,
         "duckdb_baselines": duckdb_baselines,
@@ -252,21 +477,105 @@ def main() -> None:
         "tpcds_parse_baseline": tpcds_parse_baseline,
         "tpcds_exec_indices": tpcds_exec_indices,
         "tpcds_exec_fingerprints": tpcds_exec_fingerprints,
+        "tpcds_schema_lines": tpcds_schema_lines,
+        "tpcds_exec_qcov": tpcds_exec_qcov,
+        "tpcds_parse_qcov": tpcds_parse_qcov,
+        "qmask_table": qmask_table,
+        "fixture_qcov": fixture_qcov,
+        "fixture_counts": fixture_counts,
+        "fixture_schema_lines": fixture_schema_lines,
+        "fixture_method_files": fixture_method_files,
         "env_invariants": env_invariants,
         "inproc_ms_by_id": inproc_ms_by_id,
         "clean_failing_ids": clean_failing_ids,
+        "tpcds_exec_ms": tpcds_exec_ms,
     }
     raw_bytes = zlib.compress(pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL), level=9)
     OUT_PATH.write_bytes(raw_bytes)
     print(
         f"Wrote {OUT_PATH} ({len(raw_bytes)} bytes) in {time.monotonic() - t0:.2f}s: "
         f"duckdb={len(duckdb_baselines)}/{len(duckdb_opt_methods)}, "
-        f"tpch={len(tpch_pairs)}, tpcds_exec={len(tpcds_exec_indices)}/{len(tpcds_sqls)}, "
+        f"tpch={len(tpch_pairs)}, tpcds_exec={len(tpcds_exec_indices)}/{len(tpcds_sqls)} ({tpcds_exec_ms}ms), "
+        f"qcov_files={len(fixture_qcov)}, qmasks={len(qmask_table)}, "
         f"dialect_parents={len(dialect_subclasses)}, "
         f"timed={len(inproc_ms_by_id)}, clean_fails={len(clean_failing_ids)}",
         file=sys.stderr,
     )
 
 
+def add_compiled_timings() -> None:
+    """Measure exact in-process CPU timings and compiled-mode skips under /sqlglot_c
+    and merge them into existing baselines.bin."""
+    t0 = time.monotonic()
+    sys.path.insert(0, str(APP_DIR))
+    sys.path.insert(0, str(SQLGLOT_DIR))
+    os.chdir(SQLGLOT_DIR)
+
+    import selector
+
+    cov_map = pickle.loads(zlib.decompress((APP_DIR / "coverage_map.bin").read_bytes()))
+    data = pickle.loads(zlib.decompress(OUT_PATH.read_bytes()))
+    test_by_num = {
+        idx: {"number": idx, "id": tid, "file": tid.split("::")[0]}
+        for idx, tid in enumerate(cov_map["test_ids"])
+    }
+
+    compiled_files: set[str] = set()
+    for p in (SQLGLOT_DIR / "sqlglot").rglob("*.so"):
+        stem = p.name.split(".")[0]
+        if stem.endswith("__mypyc"):
+            continue
+        rel = p.relative_to(SQLGLOT_DIR).with_name(stem + ".py").as_posix()
+        compiled_files.add(rel)
+
+    verifier = selector.InProcessVerifier(cov_map, test_by_num)
+    verifier._ensure_initialized()
+    gc.collect()
+    gc.freeze()
+
+    inproc_ms_c_by_id: dict[str, int] = {}
+    clean_failing_c_ids: set[str] = set()
+    compiled_skipped_ids: set[str] = set()
+    for num, t_info in test_by_num.items():
+        if not verifier._is_runnable_fast(num, 0):
+            continue
+        t_start = time.process_time()
+        st = verifier._run_test_status(num)
+        dt_ms = max(1, int(round((time.process_time() - t_start) * 1000)))
+        tid = t_info["id"]
+        if st == "FAIL":
+            clean_failing_c_ids.add(tid)
+        elif st == "SKIP":
+            compiled_skipped_ids.add(tid)
+            inproc_ms_c_by_id[tid] = dt_ms
+        else:
+            inproc_ms_c_by_id[tid] = dt_ms
+
+    t_tpcds = time.process_time()
+    ok_tpcds = verifier._verify_execute_tpcds([])
+    tpcds_exec_c_ms = max(100, int(round((time.process_time() - t_tpcds) * 1000)))
+    if not ok_tpcds:
+        raise RuntimeError("Clean compiled _verify_execute_tpcds failed during build_baselines")
+
+    data["compiled_files"] = compiled_files
+    data["inproc_ms_c_by_id"] = inproc_ms_c_by_id
+    data["clean_failing_c_ids"] = clean_failing_c_ids
+    data["compiled_skipped_ids"] = compiled_skipped_ids
+    data["tpcds_exec_c_ms"] = tpcds_exec_c_ms
+
+    raw_bytes = zlib.compress(pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL), level=9)
+    OUT_PATH.write_bytes(raw_bytes)
+    print(
+        f"Updated {OUT_PATH} with compiled timings ({len(raw_bytes)} bytes) in {time.monotonic() - t0:.2f}s: "
+        f"compiled_so={len(compiled_files)}, timed_c={len(inproc_ms_c_by_id)}, "
+        f"tpcds_exec_c={tpcds_exec_c_ms}ms, skipped_c={len(compiled_skipped_ids)}, "
+        f"clean_fails_c={len(clean_failing_c_ids)}",
+        file=sys.stderr,
+    )
+
+
 if __name__ == "__main__":
-    main()
+    if "--compiled-timings" in sys.argv:
+        add_compiled_timings()
+    else:
+        main()
