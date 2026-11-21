@@ -1699,8 +1699,14 @@ class InProcessVerifier:
                                 self.duckdb_opt_methods.add(fn.name)
 
         import sqlglot
+        from sqlglot.dialects.dialect import Dialect
         import tests.test_executor as mod_exec
         import tests.test_optimizer as mod_opt
+
+        _ = Dialect.classes
+        for t_rel in self.cov_map.get("sources", {}):
+            if t_rel.startswith("sqlglot/typing/") and t_rel != "sqlglot/typing/__init__.py":
+                importlib.import_module(t_rel[:-3].replace("/", "."))
 
         self.sqlglot_mod = sqlglot
         self.mod_opt = mod_opt
@@ -1889,110 +1895,211 @@ class InProcessVerifier:
                 sub.__init_subclass__()
 
         if issubclass(orig_cls, Dialect) and orig_cls is not Dialect:
+            from sqlglot.dialects.dialect import _with_strict_time_inverse
+            from sqlglot.trie import new_trie
+
             for d_key, d_val in list(_Dialect._classes.items()):
                 if d_val is new_cls:
                     _Dialect._classes[d_key] = orig_cls
 
-    def apply_patch(self, changed_py_files: list[tuple[str, str]]) -> list:
+            def _refresh_dialect_tries(d_cls: type) -> None:
+                for attr_name, compute_fn in (
+                    ("TIME_TRIE", lambda c: new_trie(c.TIME_MAPPING)),
+                    (
+                        "FORMAT_TRIE",
+                        lambda c: new_trie(c.FORMAT_MAPPING) if c.FORMAT_MAPPING else c.TIME_TRIE,
+                    ),
+                    (
+                        "INVERSE_TIME_MAPPING",
+                        lambda c: _with_strict_time_inverse(
+                            {v: k for k, v in c.TIME_MAPPING.items()}
+                            | (c.__dict__.get("INVERSE_TIME_MAPPING") or {})
+                        ),
+                    ),
+                    ("INVERSE_TIME_TRIE", lambda c: new_trie(c.INVERSE_TIME_MAPPING)),
+                    (
+                        "INVERSE_FORMAT_MAPPING",
+                        lambda c: _with_strict_time_inverse({v: k for k, v in c.FORMAT_MAPPING.items()}),
+                    ),
+                    ("INVERSE_FORMAT_TRIE", lambda c: new_trie(c.INVERSE_FORMAT_MAPPING)),
+                    (
+                        "INVERSE_CREATABLE_KIND_MAPPING",
+                        lambda c: {v: k for k, v in c.CREATABLE_KIND_MAPPING.items()},
+                    ),
+                ):
+                    old_val = d_cls.__dict__.get(attr_name)
+                    new_val = compute_fn(d_cls)
+                    if old_val != new_val:
+                        if attr_name in d_cls.__dict__:
+                            undo_actions.append(("setattr", d_cls, attr_name, old_val))
+                        else:
+                            undo_actions.append(("delattr", d_cls, attr_name))
+                        setattr(d_cls, attr_name, new_val)
+
+            for sub in _iter_subclasses(orig_cls):
+                _refresh_dialect_tries(sub)
+
+        from sqlglot.parser import Parser
+        from sqlglot.trie import new_trie as _parser_new_trie
+
+        if issubclass(orig_cls, Parser):
+            for p_cls in (orig_cls, *_iter_subclasses(orig_cls)):
+                for attr_name, src_name in (("SHOW_TRIE", "SHOW_PARSERS"), ("SET_TRIE", "SET_PARSERS")):
+                    old_val = p_cls.__dict__.get(attr_name)
+                    new_val = _parser_new_trie(key.split(" ") for key in getattr(p_cls, src_name))
+                    if old_val != new_val:
+                        if attr_name in p_cls.__dict__:
+                            undo_actions.append(("setattr", p_cls, attr_name, old_val))
+                        else:
+                            undo_actions.append(("delattr", p_cls, attr_name))
+                        setattr(p_cls, attr_name, new_val)
+
+    def _sync_single_module(
+        self, rel_path: str, new_source: str, undo_actions: list
+    ) -> dict[str, object]:
         import importlib
         import types
+
+        no_ext = rel_path[:-3]
+        mod_name = no_ext.replace("/", ".")
+        if mod_name.endswith(".__init__"):
+            mod_name = mod_name[:-9]
+
+        mod = importlib.import_module(mod_name)
+        temp_ns = dict(mod.__dict__)
+        code_obj = compile(new_source, str((self.sqlglot_root or Path(".")) / rel_path), "exec")
+        exec(code_obj, temp_ns)
+
+        skip_mod_keys = {
+            "__name__",
+            "__doc__",
+            "__package__",
+            "__loader__",
+            "__spec__",
+            "__file__",
+            "__cached__",
+            "__builtins__",
+        }
+        cls_map: dict[type, type] = {}
+        for k, new_v in temp_ns.items():
+            if k in skip_mod_keys:
+                continue
+            orig_v = mod.__dict__.get(k)
+            if (
+                isinstance(orig_v, type)
+                and isinstance(new_v, type)
+                and orig_v.__name__ == new_v.__name__
+            ):
+                _collect_class_pairs(orig_v, new_v, cls_map)
+
+        if cls_map:
+            seen_refs: set[int] = set()
+            for k in list(temp_ns.keys()):
+                if k not in skip_mod_keys and not isinstance(temp_ns[k], type):
+                    temp_ns[k] = _rewrite_cls_refs(temp_ns[k], cls_map, seen_refs)
+
+        changed_globals: dict[str, object] = {}
+        for k, new_v in temp_ns.items():
+            if k in skip_mod_keys:
+                continue
+            if k not in mod.__dict__:
+                setattr(mod, k, new_v)
+                undo_actions.append(("delattr", mod, k))
+                changed_globals[k] = new_v
+                continue
+            orig_v = mod.__dict__[k]
+            if orig_v is new_v:
+                continue
+            if type(orig_v) is types.FunctionType and type(new_v) is types.FunctionType:
+                if _funcs_equal(orig_v, new_v):
+                    continue
+                if orig_v.__closure__ == new_v.__closure__:
+                    old_state = (orig_v.__code__, orig_v.__defaults__, orig_v.__kwdefaults__)
+                    orig_v.__code__ = new_v.__code__
+                    orig_v.__defaults__ = new_v.__defaults__
+                    orig_v.__kwdefaults__ = new_v.__kwdefaults__
+                    undo_actions.append(("func_code", orig_v, old_state))
+                else:
+                    setattr(mod, k, new_v)
+                    undo_actions.append(("setattr", mod, k, orig_v))
+                    self._propagate_binding(mod, k, orig_v, new_v, undo_actions)
+                    changed_globals[k] = new_v
+            elif (
+                isinstance(orig_v, type)
+                and isinstance(new_v, type)
+                and orig_v.__name__ == new_v.__name__
+            ):
+                self._sync_class_inplace(orig_v, new_v, undo_actions, cls_map)
+            elif isinstance(orig_v, dict) and isinstance(new_v, dict):
+                if orig_v != new_v:
+                    old_copy = dict(orig_v)
+                    orig_v.clear()
+                    orig_v.update(new_v)
+                    undo_actions.append(("dict_restore", orig_v, old_copy))
+                    changed_globals[k] = orig_v
+            elif isinstance(orig_v, set) and isinstance(new_v, set):
+                if orig_v != new_v:
+                    old_copy = set(orig_v)
+                    orig_v.clear()
+                    orig_v.update(new_v)
+                    undo_actions.append(("set_restore", orig_v, old_copy))
+                    changed_globals[k] = orig_v
+            else:
+                if orig_v != new_v:
+                    setattr(mod, k, new_v)
+                    undo_actions.append(("setattr", mod, k, orig_v))
+                    self._propagate_binding(mod, k, orig_v, new_v, undo_actions)
+                    changed_globals[k] = new_v
+        return changed_globals
+
+    def apply_patch(self, changed_py_files: list[tuple[str, str]]) -> list:
+        import importlib
         import sqlglot.generator
 
         undo_actions: list = []
         self.use_pickle_in_pool = any(rel == "sqlglot/serde.py" for rel, _ in changed_py_files)
         sources_map = self.cov_map.get("sources", {})
+        patched_rels = {rel for rel, _ in changed_py_files}
 
-        for rel_path, new_source in changed_py_files:
-            # Ensure dialect module is pre-imported in clean state if patching parser/generator/dialect
+        # Ensure dialect modules are pre-imported if patching parser/generator/dialect
+        for rel_path, _ in changed_py_files:
             if rel_path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/")):
                 stem = pathlib.Path(rel_path).stem
                 if stem not in ("__init__", "dialect", "base") and f"sqlglot/dialects/{stem}.py" in sources_map:
                     importlib.import_module(f"sqlglot.dialects.{stem}")
 
-            no_ext = rel_path[:-3]
-            mod_name = no_ext.replace("/", ".")
-            if mod_name.endswith(".__init__"):
-                mod_name = mod_name[:-9]
+        typing_changed = False
+        for rel_path, new_source in changed_py_files:
+            self._sync_single_module(rel_path, new_source, undo_actions)
+            if rel_path.startswith("sqlglot/typing/"):
+                typing_changed = True
 
-            mod = importlib.import_module(mod_name)
-            temp_ns = dict(mod.__dict__)
-            code_obj = compile(new_source, str((self.sqlglot_root or Path(".")) / rel_path), "exec")
-            exec(code_obj, temp_ns)
-
-            skip_mod_keys = {
-                "__name__",
-                "__doc__",
-                "__package__",
-                "__loader__",
-                "__spec__",
-                "__file__",
-                "__cached__",
-                "__builtins__",
-            }
-            cls_map: dict[type, type] = {}
-            for k, new_v in temp_ns.items():
-                if k in skip_mod_keys:
-                    continue
-                orig_v = mod.__dict__.get(k)
-                if (
-                    isinstance(orig_v, type)
-                    and isinstance(new_v, type)
-                    and orig_v.__name__ == new_v.__name__
-                ):
-                    _collect_class_pairs(orig_v, new_v, cls_map)
-
-            if cls_map:
-                seen_refs: set[int] = set()
-                for k in list(temp_ns.keys()):
-                    if k not in skip_mod_keys and not isinstance(temp_ns[k], type):
-                        temp_ns[k] = _rewrite_cls_refs(temp_ns[k], cls_map, seen_refs)
-
-            for k, new_v in temp_ns.items():
-                if k in skip_mod_keys:
-                    continue
-                if k not in mod.__dict__:
-                    setattr(mod, k, new_v)
-                    undo_actions.append(("delattr", mod, k))
-                    continue
-                orig_v = mod.__dict__[k]
-                if orig_v is new_v:
-                    continue
-                if type(orig_v) is types.FunctionType and type(new_v) is types.FunctionType:
-                    if _funcs_equal(orig_v, new_v):
-                        continue
-                    if orig_v.__closure__ == new_v.__closure__:
-                        old_state = (orig_v.__code__, orig_v.__defaults__, orig_v.__kwdefaults__)
-                        orig_v.__code__ = new_v.__code__
-                        orig_v.__defaults__ = new_v.__defaults__
-                        orig_v.__kwdefaults__ = new_v.__kwdefaults__
-                        undo_actions.append(("func_code", orig_v, old_state))
-                    else:
-                        setattr(mod, k, new_v)
-                        undo_actions.append(("setattr", mod, k, orig_v))
-                        self._propagate_binding(mod, k, orig_v, new_v, undo_actions)
-                elif (
-                    isinstance(orig_v, type)
-                    and isinstance(new_v, type)
-                    and orig_v.__name__ == new_v.__name__
-                ):
-                    self._sync_class_inplace(orig_v, new_v, undo_actions, cls_map)
-                elif isinstance(orig_v, dict) and isinstance(new_v, dict):
-                    if orig_v != new_v:
-                        old_copy = dict(orig_v)
-                        orig_v.clear()
-                        orig_v.update(new_v)
-                        undo_actions.append(("dict_restore", orig_v, old_copy))
-                elif isinstance(orig_v, set) and isinstance(new_v, set):
-                    if orig_v != new_v:
-                        old_copy = set(orig_v)
-                        orig_v.clear()
-                        orig_v.update(new_v)
-                        undo_actions.append(("set_restore", orig_v, old_copy))
-                else:
-                    if orig_v != new_v:
-                        setattr(mod, k, new_v)
-                        undo_actions.append(("setattr", mod, k, orig_v))
-                        self._propagate_binding(mod, k, orig_v, new_v, undo_actions)
+        # Propagate EXPRESSION_METADATA only down dependent typing children
+        if typing_changed:
+            typing_deps = (
+                ("sqlglot/typing/__init__.py", "sqlglot/typing/bigquery.py"),
+                ("sqlglot/typing/__init__.py", "sqlglot/typing/clickhouse.py"),
+                ("sqlglot/typing/__init__.py", "sqlglot/typing/duckdb.py"),
+                ("sqlglot/typing/__init__.py", "sqlglot/typing/hive.py"),
+                ("sqlglot/typing/__init__.py", "sqlglot/typing/mysql.py"),
+                ("sqlglot/typing/__init__.py", "sqlglot/typing/postgres.py"),
+                ("sqlglot/typing/__init__.py", "sqlglot/typing/presto.py"),
+                ("sqlglot/typing/__init__.py", "sqlglot/typing/snowflake.py"),
+                ("sqlglot/typing/__init__.py", "sqlglot/typing/sqlite.py"),
+                ("sqlglot/typing/__init__.py", "sqlglot/typing/tsql.py"),
+                ("sqlglot/typing/postgres.py", "sqlglot/typing/redshift.py"),
+                ("sqlglot/typing/hive.py", "sqlglot/typing/spark2.py"),
+                ("sqlglot/typing/spark2.py", "sqlglot/typing/spark.py"),
+                ("sqlglot/typing/spark.py", "sqlglot/typing/databricks.py"),
+            )
+            dirty_typing = {r for r in patched_rels if r.startswith("sqlglot/typing/")}
+            for parent_rel, child_rel in typing_deps:
+                if parent_rel in dirty_typing and child_rel not in patched_rels and child_rel in sources_map:
+                    t_mod_name = child_rel[:-3].replace("/", ".")
+                    if t_mod_name in sys.modules:
+                        t_src = zlib.decompress(sources_map[child_rel]).decode("utf-8")
+                        self._sync_single_module(child_rel, t_src, undo_actions)
+                    dirty_typing.add(child_rel)
 
         sqlglot.generator._DISPATCH_CACHE.clear()
         return undo_actions
