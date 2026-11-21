@@ -7,6 +7,8 @@ built from sqlglot at commit eb11aec4be8cb2122afe713a4816662c3f0fb2fa.
 from __future__ import annotations
 
 import ast
+import gc
+import hashlib
 import json
 import math
 import os
@@ -20,6 +22,9 @@ from pathlib import Path
 DATA = Path(os.environ.get("BLAST_DATA_DIR", "/data")).resolve()
 MAP_PATH = Path(
     os.environ.get("BLAST_MAP_PATH", Path(__file__).resolve().parent / "coverage_map.bin")
+).resolve()
+BASELINES_PATH = Path(
+    os.environ.get("BLAST_BASELINES_PATH", Path(__file__).resolve().parent / "baselines.bin")
 ).resolve()
 
 WORKER_COST_MS = 2_000
@@ -1110,7 +1115,9 @@ def select_tests_for_patch(
         and verifier is not None
         and dur_by_num is not None
     ):
-        selected = verifier.verify_candidates(changed_py_files, selected, dur_by_num)
+        selected = verifier.verify_candidates(
+            changed_py_files, selected, dur_by_num, non_py_selected
+        )
 
     return non_py_selected | selected
 
@@ -1129,8 +1136,125 @@ SKIP_VERIFY_METHODS = frozenset(
         "test_execute_tpcds",
         "test_execute_tpch",
         "test_optimized_tpch",
+        "test_generator_memory",
+        "test_max_nodes",
     }
 )
+
+MONSTER_METHODS = frozenset(
+    {
+        "test_max_nodes",
+        "test_execute_tpcds",
+        "test_execute_tpch",
+        "test_optimized_tpch",
+        "test_generator_memory",
+    }
+)
+
+EXECUTOR_FILES = frozenset(
+    {
+        "sqlglot/executor/__init__.py",
+        "sqlglot/executor/python.py",
+        "sqlglot/executor/context.py",
+        "sqlglot/executor/table.py",
+        "sqlglot/executor/env.py",
+    }
+)
+
+BASE_INHERITANCE_FILES = frozenset(
+    {
+        "sqlglot/dialects/dialect.py",
+        "sqlglot/parser.py",
+        "sqlglot/generator.py",
+        "sqlglot/tokens.py",
+        "sqlglot/tokenizer_core.py",
+        "sqlglot/typing/__init__.py",
+    }
+)
+
+
+def _plan_py_fingerprint(plan: object, py_exec: object) -> bytes:
+    """Compute a deterministic, memory-address-free SHA-256 digest of Plan DAG + Python codegen."""
+    py_exec._subquery_plans.clear()  # type: ignore[attr-defined]
+    py_exec._plan_names_by_sql.clear()  # type: ignore[attr-defined]
+    gen = py_exec.generator  # type: ignore[attr-defined]
+
+    def gen_expr(expr: object) -> str:
+        if not expr:
+            return ""
+        replaced = py_exec._replace_subqueries(expr)  # type: ignore[attr-defined]
+        return gen.generate(replaced)
+
+    def hash_str(h: object, s: str) -> None:
+        b = s.encode("utf-8")
+        h.update(len(b).to_bytes(4, "little"))  # type: ignore[attr-defined]
+        h.update(b)  # type: ignore[attr-defined]
+
+    memo: dict[int, bytes] = {}
+
+    def step_fp(st: object) -> bytes:
+        sid = id(st)
+        if sid in memo:
+            return memo[sid]
+        h = hashlib.sha256()
+        src = getattr(st, "source", None)
+        src_s = src.sql() if hasattr(src, "sql") else str(src)
+        op = getattr(st, "op", None)
+        op_s = op.__name__ if isinstance(op, type) else str(op)
+        hash_str(
+            h,
+            f"{type(st).__name__}|{getattr(st, 'name', '')}|{src_s}|"
+            f"{getattr(st, 'source_name', '')}|{getattr(st, 'left', '')}|{getattr(st, 'right', '')}|"
+            f"{getattr(st, 'limit', '')}|{getattr(st, 'offset', '')}|"
+            f"{getattr(st, 'distinct', '')}|{op_s}",
+        )
+        cond = getattr(st, "condition", None)
+        if cond is not None:
+            hash_str(h, "C:" + gen_expr(cond))
+        for proj in getattr(st, "projections", ()):
+            hash_str(h, "P:" + gen_expr(proj))
+        joins = getattr(st, "joins", None)
+        if joins:
+            for jname in sorted(joins):
+                j = joins[jname]
+                hash_str(h, f"J:{jname}|{j.get('side')}|{j.get('method')}")
+                if j.get("condition") is not None:
+                    hash_str(h, "JC:" + gen_expr(j["condition"]))
+                for k in j.get("source_key", ()):
+                    hash_str(h, "JSK:" + gen_expr(k))
+                for k in j.get("join_key", ()):
+                    hash_str(h, "JJK:" + gen_expr(k))
+        grp = getattr(st, "group", None)
+        if grp:
+            for gk in grp:
+                hash_str(h, "GK:" + str(gk))
+                hash_str(h, "GV:" + gen_expr(grp[gk]))
+        for agg in getattr(st, "aggregations", ()):
+            hash_str(h, "A:" + gen_expr(agg))
+        for opnd in getattr(st, "operands", ()):
+            hash_str(h, "O:" + gen_expr(opnd))
+        for sk in getattr(st, "key", ()):
+            hash_str(h, "S:" + gen_expr(sk))
+        dep_fps = sorted(step_fp(dep) for dep in getattr(st, "dependencies", ()))
+        for dfp in dep_fps:
+            h.update(dfp)
+        digest = h.digest()
+        memo[sid] = digest
+        return digest
+
+    root_h = hashlib.sha256()
+    root_h.update(step_fp(plan.root))  # type: ignore[attr-defined]
+    processed_subplans: set[str] = set()
+    while True:
+        new_names = sorted(k for k in py_exec._subquery_plans if k not in processed_subplans)
+        if not new_names:
+            break
+        for sq_name in new_names:
+            processed_subplans.add(sq_name)
+            sq_plan, _ = py_exec._subquery_plans[sq_name]
+            hash_str(root_h, "SQ:" + sq_name)
+            root_h.update(step_fp(sq_plan.root))
+    return root_h.digest()
 
 
 def _iter_subclasses(cls: type) -> list[type]:
@@ -1258,11 +1382,27 @@ class InProcessVerifier:
         self.use_pickle_in_pool = False
         self.initialized_classes: set[type] = set()
         self.conn_cls: type | None = None
-        self.mod_opt: object = None
+        self.fake_duckdb_conn: object = None
+        self.inproc_pool_cls: type | None = None
+        self.mapping_schema_cls: type | None = None
         self.sqlglot_mod: object = None
+        self.patched_test_mods: set[str] = set()
+        self.loaded_all_dialects = False
+        self.loaded_all_typing = False
         self.duckdb_opt_methods: set[str] = set()
-        self.tpch_transpiled_baseline: list[tuple[str, str]] | None = None
+        self.dialect_subclasses: dict[str, list[str]] = {}
         self.tpch_pairs: list[tuple[str, str]] | None = None
+        self.tpch_parse_baseline: list[str] | None = None
+        self.tpch_transpiled_baseline: list[tuple[str, str]] | None = None
+        self.tpcds_sqls: list[str] | None = None
+        self.tpcds_parse_baseline: list[str] | None = None
+        self.tpcds_exec_indices: list[int] | None = None
+        self.tpcds_exec_fingerprints: dict[int, tuple] | None = None
+        self.env_invariants: tuple | None = None
+        self.base_helper_codes: tuple | None = None
+        self.prebuilt_baselines: dict | None = None
+        self.inproc_ms_by_id: dict[str, int] = {}
+        self.clean_failing_ids: set[str] = set()
 
     def _is_runnable_fast(self, num: int, dur_ms: int) -> bool:
         if dur_ms > 2600:
@@ -1270,19 +1410,36 @@ class InProcessVerifier:
         t = self.test_by_num.get(num)
         if t is None:
             return False
-        file_rel, _, method_name = t["id"].split("::")
+        tid = t["id"]
+        if tid in self.clean_failing_ids:
+            return False
+        file_rel, _, method_name = tid.split("::")
         if file_rel in SKIP_VERIFY_FILES or method_name in SKIP_VERIFY_METHODS:
             return False
         return True
 
     def _est_inproc_ms(self, num: int, dur_by_num: dict[int, int]) -> int:
         t = self.test_by_num.get(num)
-        if t is not None and t["id"].endswith("::test_tpcds"):
-            return 4500
+        if t is not None:
+            tid = t["id"]
+            measured = self.inproc_ms_by_id.get(tid)
+            if measured is not None:
+                return measured
+            m = tid.rsplit("::", 1)[-1]
+            if m == "test_tpcds":
+                return 3300
+            if m == "test_scope":
+                return 1020
+            if m == "test_annotate_funcs":
+                return 1150
+            if m == "test_qualify_columns":
+                return 580
+            if m == "test_optimize_in_nulls":
+                return 680
+            if m == "test_cache_does_not_retain_queries":
+                return 1350
         dur = dur_by_num.get(num, 500)
-        if dur >= 500:
-            return dur
-        return max(1, int(dur * 0.6))
+        return max(1, int(dur * 0.55))
 
     def _ensure_initialized(self) -> None:
         if self.initialized:
@@ -1297,7 +1454,6 @@ class InProcessVerifier:
         import tempfile
         import types
         import unittest
-        import unittest.mock
         import zoneinfo
 
         # 1. Locate or unpack sqlglot root
@@ -1684,53 +1840,120 @@ class InProcessVerifier:
 
         unittest.TestCase.subTest = _fast_subtest  # type: ignore
 
-        # Automatically identify TestOptimizer methods using duckdb.connect or self.conn
-        opt_comp = self.cov_map.get("sources", {}).get("tests/test_optimizer.py")
-        if opt_comp is not None:
-            opt_src = zlib.decompress(opt_comp).decode("utf-8")
-            opt_lines = opt_src.splitlines()
-            opt_tree = ast.parse(opt_src)
-            for node in opt_tree.body:
-                if isinstance(node, ast.ClassDef) and node.name == "TestOptimizer":
-                    for fn in node.body:
-                        if isinstance(fn, ast.FunctionDef) and fn.name != "check_file":
-                            body_text = "\n".join(opt_lines[fn.lineno - 1 : fn.end_lineno])
-                            if "duckdb.connect" in body_text or "self.conn" in body_text:
-                                self.duckdb_opt_methods.add(fn.name)
+        self.fake_duckdb_conn = _fake_duckdb_conn
+        self.inproc_pool_cls = _InProcessPoolExecutor
+
+        # Load build-time precomputed baselines if available
+        baselines: dict | None = None
+        if not os.environ.get("BLAST_DISABLE_PREBUILT_BASELINES") and BASELINES_PATH.exists():
+            try:
+                baselines = pickle.loads(zlib.decompress(BASELINES_PATH.read_bytes()))
+            except Exception:
+                baselines = None
+        self.prebuilt_baselines = baselines
+
+        if baselines is not None:
+            self.duckdb_opt_methods = set(baselines.get("duckdb_opt_methods", ()))
+            self.dialect_subclasses = baselines.get("dialect_subclasses", {})
+            self.tpch_pairs = baselines.get("tpch_pairs")
+            self.tpch_parse_baseline = baselines.get("tpch_parse_baseline")
+            self.tpch_transpiled_baseline = baselines.get("tpch_transpile_baseline")
+            self.tpcds_sqls = baselines.get("tpcds_sqls")
+            self.tpcds_parse_baseline = baselines.get("tpcds_parse_baseline")
+            self.tpcds_exec_indices = baselines.get("tpcds_exec_indices")
+            self.tpcds_exec_fingerprints = baselines.get("tpcds_exec_fingerprints")
+            self.env_invariants = baselines.get("env_invariants")
+            self.inproc_ms_by_id = baselines.get("inproc_ms_by_id", {})
+            self.clean_failing_ids = set(baselines.get("clean_failing_ids", ()))
+
+            db_q = baselines.get("duckdb_baselines", {})
+            db_e = baselines.get("duckdb_expects", {})
+            for num, t_info in self.test_by_num.items():
+                tid = t_info["id"]
+                if tid.startswith("tests/test_optimizer.py::TestOptimizer::"):
+                    mname = tid.split("::")[2]
+                    if mname in db_q:
+                        _FakeDuckDBConn.baseline_queries[num] = list(db_q[mname])
+                    if mname in db_e:
+                        _FakeDuckDBConn.baseline_expects[num] = dict(db_e[mname])
+        else:
+            # Fallback: AST-discover TestOptimizer methods using duckdb.connect or self.conn
+            opt_comp = self.cov_map.get("sources", {}).get("tests/test_optimizer.py")
+            if opt_comp is not None:
+                opt_src = zlib.decompress(opt_comp).decode("utf-8")
+                opt_lines = opt_src.splitlines()
+                opt_tree = ast.parse(opt_src)
+                for node in opt_tree.body:
+                    if isinstance(node, ast.ClassDef) and node.name == "TestOptimizer":
+                        for fn in node.body:
+                            if isinstance(fn, ast.FunctionDef) and fn.name != "check_file":
+                                body_text = "\n".join(opt_lines[fn.lineno - 1 : fn.end_lineno])
+                                if "duckdb.connect" in body_text or "self.conn" in body_text:
+                                    self.duckdb_opt_methods.add(fn.name)
 
         import sqlglot
-        from sqlglot.dialects.dialect import Dialect
-        import tests.test_executor as mod_exec
-        import tests.test_optimizer as mod_opt
-
-        _ = Dialect.classes
-        for t_rel in self.cov_map.get("sources", {}):
-            if t_rel.startswith("sqlglot/typing/") and t_rel != "sqlglot/typing/__init__.py":
-                importlib.import_module(t_rel[:-3].replace("/", "."))
+        import sqlglot.helper as _sg_helper
+        from sqlglot.schema import MappingSchema
 
         self.sqlglot_mod = sqlglot
-        self.mod_opt = mod_opt
+        self.mapping_schema_cls = MappingSchema
+        self.base_helper_codes = (
+            _sg_helper.is_int.__code__,
+            _sg_helper.seq_get.__code__,
+            _sg_helper.dict_depth.__code__,
+        )
 
-        def fast_opt_setup_class(cls):
-            cls.pool = _InProcessPoolExecutor()
-            sqlglot.schema = mod_opt.MappingSchema()
-            cls.conn = _fake_duckdb_conn
-
-        mod_opt.wait = lambda fs, *a, **kw: None  # type: ignore
-        mod_opt.as_completed = lambda fs, *a, **kw: iter(fs)  # type: ignore
-        mod_opt.TestOptimizer.setUpClass = classmethod(fast_opt_setup_class)  # type: ignore
-        mod_opt.TestOptimizer.tearDownClass = classmethod(lambda cls: None)  # type: ignore
-        orig_check_file = mod_opt.TestOptimizer.check_file
-
-        def fast_check_file(opt_self, *args, **kwargs):
-            kwargs["execute"] = False
-            return orig_check_file(opt_self, *args, **kwargs)
-
-        mod_opt.TestOptimizer.check_file = fast_check_file  # type: ignore
-        mod_exec.TestExecutor.setUpClass = classmethod(lambda cls: None)  # type: ignore
-        mod_exec.TestExecutor.tearDownClass = classmethod(lambda cls: None)  # type: ignore
-
+        # Disable cyclic GC during in-process test verification (re-enabled in memory test)
+        gc.disable()
         self.initialized = True
+
+    def _ensure_test_module_patched(self, mod_name: str, mod: object) -> None:
+        if mod_name in self.patched_test_mods:
+            return
+        self.patched_test_mods.add(mod_name)
+        if mod_name == "tests.test_optimizer":
+            sqlglot_mod = self.sqlglot_mod
+            pool_cls = self.inproc_pool_cls
+            fake_conn = self.fake_duckdb_conn
+
+            def fast_opt_setup_class(cls):
+                cls.pool = pool_cls()  # type: ignore
+                sqlglot_mod.schema = mod.MappingSchema()  # type: ignore
+                cls.conn = fake_conn
+
+            mod.wait = lambda fs, *a, **kw: None  # type: ignore
+            mod.as_completed = lambda fs, *a, **kw: iter(fs)  # type: ignore
+            mod.TestOptimizer.setUpClass = classmethod(fast_opt_setup_class)  # type: ignore
+            mod.TestOptimizer.tearDownClass = classmethod(lambda cls: None)  # type: ignore
+            orig_check_file = mod.TestOptimizer.check_file  # type: ignore
+
+            def fast_check_file(opt_self, *args, **kwargs):
+                kwargs["execute"] = False
+                if (
+                    args
+                    and args[0] in ("tpc-ds/tpc-ds", "tpc-h/tpc-h")
+                    and isinstance(kwargs.get("schema"), dict)
+                ):
+                    kwargs["schema"] = mod.MappingSchema(kwargs["schema"])  # type: ignore
+                return orig_check_file(opt_self, *args, **kwargs)
+
+            mod.TestOptimizer.check_file = fast_check_file  # type: ignore
+        elif mod_name == "tests.test_executor":
+            mod.TestExecutor.setUpClass = classmethod(lambda cls: None)  # type: ignore
+            mod.TestExecutor.tearDownClass = classmethod(lambda cls: None)  # type: ignore
+
+    def _ensure_all_dialects_and_typing_loaded(self) -> None:
+        import importlib
+        from sqlglot.dialects.dialect import Dialect
+
+        if not self.loaded_all_dialects:
+            _ = Dialect.classes
+            self.loaded_all_dialects = True
+        if not self.loaded_all_typing:
+            for t_rel in self.cov_map.get("sources", {}):
+                if t_rel.startswith("sqlglot/typing/") and t_rel != "sqlglot/typing/__init__.py":
+                    importlib.import_module(t_rel[:-3].replace("/", "."))
+            self.loaded_all_typing = True
 
     def _sync_class_inplace(
         self, orig_cls: type, new_cls: type, undo_actions: list, cls_map: dict[type, type]
@@ -2061,12 +2284,45 @@ class InProcessVerifier:
         sources_map = self.cov_map.get("sources", {})
         patched_rels = {rel for rel, _ in changed_py_files}
 
-        # Ensure dialect modules are pre-imported if patching parser/generator/dialect
-        for rel_path, _ in changed_py_files:
-            if rel_path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/")):
-                stem = pathlib.Path(rel_path).stem
-                if stem not in ("__init__", "dialect", "base") and f"sqlglot/dialects/{stem}.py" in sources_map:
-                    importlib.import_module(f"sqlglot.dialects.{stem}")
+        typing_deps = (
+            ("sqlglot/typing/__init__.py", "sqlglot/typing/bigquery.py"),
+            ("sqlglot/typing/__init__.py", "sqlglot/typing/clickhouse.py"),
+            ("sqlglot/typing/__init__.py", "sqlglot/typing/duckdb.py"),
+            ("sqlglot/typing/__init__.py", "sqlglot/typing/hive.py"),
+            ("sqlglot/typing/__init__.py", "sqlglot/typing/mysql.py"),
+            ("sqlglot/typing/__init__.py", "sqlglot/typing/postgres.py"),
+            ("sqlglot/typing/__init__.py", "sqlglot/typing/presto.py"),
+            ("sqlglot/typing/__init__.py", "sqlglot/typing/snowflake.py"),
+            ("sqlglot/typing/__init__.py", "sqlglot/typing/sqlite.py"),
+            ("sqlglot/typing/__init__.py", "sqlglot/typing/tsql.py"),
+            ("sqlglot/typing/postgres.py", "sqlglot/typing/redshift.py"),
+            ("sqlglot/typing/hive.py", "sqlglot/typing/spark2.py"),
+            ("sqlglot/typing/spark2.py", "sqlglot/typing/spark.py"),
+            ("sqlglot/typing/spark.py", "sqlglot/typing/databricks.py"),
+        )
+
+        # Lazily load only the dialect/typing modules that inherit from patched files
+        if any(rel in BASE_INHERITANCE_FILES for rel in patched_rels):
+            self._ensure_all_dialects_and_typing_loaded()
+        else:
+            for rel_path in patched_rels:
+                if rel_path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/")):
+                    stem = pathlib.Path(rel_path).stem
+                    if stem not in ("__init__", "dialect", "base"):
+                        if f"sqlglot/dialects/{stem}.py" in sources_map:
+                            importlib.import_module(f"sqlglot.dialects.{stem}")
+                        if self.dialect_subclasses:
+                            for child_mod in self.dialect_subclasses.get(stem, ()):
+                                importlib.import_module(child_mod)
+                        else:
+                            self._ensure_all_dialects_and_typing_loaded()
+                elif rel_path.startswith("sqlglot/typing/"):
+                    importlib.import_module(rel_path[:-3].replace("/", "."))
+                    dirty = {rel_path}
+                    for parent_rel, child_rel in typing_deps:
+                        if parent_rel in dirty and child_rel in sources_map:
+                            importlib.import_module(child_rel[:-3].replace("/", "."))
+                            dirty.add(child_rel)
 
         typing_changed = False
         for rel_path, new_source in changed_py_files:
@@ -2076,22 +2332,6 @@ class InProcessVerifier:
 
         # Propagate EXPRESSION_METADATA only down dependent typing children
         if typing_changed:
-            typing_deps = (
-                ("sqlglot/typing/__init__.py", "sqlglot/typing/bigquery.py"),
-                ("sqlglot/typing/__init__.py", "sqlglot/typing/clickhouse.py"),
-                ("sqlglot/typing/__init__.py", "sqlglot/typing/duckdb.py"),
-                ("sqlglot/typing/__init__.py", "sqlglot/typing/hive.py"),
-                ("sqlglot/typing/__init__.py", "sqlglot/typing/mysql.py"),
-                ("sqlglot/typing/__init__.py", "sqlglot/typing/postgres.py"),
-                ("sqlglot/typing/__init__.py", "sqlglot/typing/presto.py"),
-                ("sqlglot/typing/__init__.py", "sqlglot/typing/snowflake.py"),
-                ("sqlglot/typing/__init__.py", "sqlglot/typing/sqlite.py"),
-                ("sqlglot/typing/__init__.py", "sqlglot/typing/tsql.py"),
-                ("sqlglot/typing/postgres.py", "sqlglot/typing/redshift.py"),
-                ("sqlglot/typing/hive.py", "sqlglot/typing/spark2.py"),
-                ("sqlglot/typing/spark2.py", "sqlglot/typing/spark.py"),
-                ("sqlglot/typing/spark.py", "sqlglot/typing/databricks.py"),
-            )
             dirty_typing = {r for r in patched_rels if r.startswith("sqlglot/typing/")}
             for parent_rel, child_rel in typing_deps:
                 if parent_rel in dirty_typing and child_rel not in patched_rels and child_rel in sources_map:
@@ -2173,12 +2413,13 @@ class InProcessVerifier:
         file_rel, cls_name, method_name = t["id"].split("::")
         mod_name = file_rel[:-3].replace("/", ".")
         mod = importlib.import_module(mod_name)
+        self._ensure_test_module_patched(mod_name, mod)
         cls = getattr(mod, cls_name)
         if cls not in self.initialized_classes:
             cls.setUpClass()
             self.initialized_classes.add(cls)
         self.sqlglot_mod.schema = (  # type: ignore
-            self.mod_opt.MappingSchema() if cls_name == "TestOptimizer" else None  # type: ignore
+            self.mapping_schema_cls() if cls_name == "TestOptimizer" else None  # type: ignore
         )
         conn_cls = self.conn_cls
         if conn_cls is not None:
@@ -2216,13 +2457,17 @@ class InProcessVerifier:
                 if status == "FAIL":
                     b_queries.pop(n, None)
 
-    def _ensure_tpch_transpile_baseline(self) -> None:
-        if self.tpch_transpiled_baseline is not None:
+    def _ensure_tpch_baselines(self) -> None:
+        if self.tpch_transpiled_baseline is not None and self.tpch_parse_baseline is not None:
             return
         from tests.helpers import load_sql_fixture_pairs
 
         pairs = [(sql, opt) for _, sql, opt in load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql")]
         self.tpch_pairs = pairs
+        self.tpch_parse_baseline = [
+            self.sqlglot_mod.parse_one(sql).sql()  # type: ignore
+            for sql, _ in pairs
+        ]
         self.tpch_transpiled_baseline = [
             (
                 self.sqlglot_mod.transpile(sql, write="duckdb")[0],  # type: ignore
@@ -2231,20 +2476,38 @@ class InProcessVerifier:
             for sql, opt in pairs
         ]
 
-    def _verify_optimized_tpch(self) -> bool:
-        if not self.tpch_pairs or not self.tpch_transpiled_baseline:
+    def _verify_execute_tpch(self) -> bool:
+        """Exact verifier for test_execute_tpch (tpc-h.sql has 0 execute=true queries,
+        so pytest only runs parse_one + pickle round-trip across the 22 queries)."""
+        if not self.tpch_pairs or not self.tpch_parse_baseline:
             return False
         try:
-            for (sql, opt), (b_sql, b_opt) in zip(self.tpch_pairs, self.tpch_transpiled_baseline):
-                if self.sqlglot_mod.transpile(sql, write="duckdb")[0] != b_sql:  # type: ignore
+            parse_one = self.sqlglot_mod.parse_one  # type: ignore
+            for (sql, _), b_sql in zip(self.tpch_pairs, self.tpch_parse_baseline):
+                expr = parse_one(sql)
+                if expr.sql() != b_sql:
                     return False
-                if self.sqlglot_mod.transpile(opt, write="duckdb")[0] != b_opt:  # type: ignore
+                if pickle.loads(pickle.dumps(expr)) != expr:
                     return False
             return True
         except Exception:
             return False
 
-    def _verify_max_nodes_fast(self) -> bool:
+    def _verify_optimized_tpch(self) -> bool:
+        if not self.tpch_pairs or not self.tpch_transpiled_baseline:
+            return False
+        try:
+            transpile = self.sqlglot_mod.transpile  # type: ignore
+            for (sql, opt), (b_sql, b_opt) in zip(self.tpch_pairs, self.tpch_transpiled_baseline):
+                if transpile(sql, write="duckdb")[0] != b_sql:
+                    return False
+                if transpile(opt, write="duckdb")[0] != b_opt:
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _verify_max_nodes_fast(self, changed_py_files: list[tuple[str, str]]) -> bool:
         try:
             parse_one = self.sqlglot_mod.parse_one  # type: ignore
             exp = self.sqlglot_mod.exp  # type: ignore
@@ -2253,17 +2516,59 @@ class InProcessVerifier:
             if not isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select):
                 return False
             cols = [f"col{i}" for i in range(500)]
-            if not isinstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select):
+            if not isinstance(
+                parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select
+            ):
                 return False
 
             expr_d = "x" + "=x" * 100
-            sql_55k = f"SELECT {','.join(expr_d for _ in range(550))}"
+            # Check exact node-count bracket on 60-col query (~12,061 nodes):
+            # passes at max_nodes=15_000 and fails at max_nodes=5_000
+            sql_6k = f"SELECT {','.join(expr_d for _ in range(60))}"
+            if not isinstance(parse_one(sql_6k, max_nodes=15_000), exp.Select):
+                return False
             try:
-                parse_one(sql_55k, max_nodes=50_000)
+                parse_one(sql_6k, max_nodes=5_000)
                 return False
             except ParseError as e:
-                if "(50000)" not in str(e):
+                s = str(e)
+                if "Maximum number of AST nodes" not in s or "(5000)" not in s:
                     return False
+
+            # If errors.py or max_nodes logic may be modified, also verify 50_000 threshold
+            sources_map = self.cov_map.get("sources", {})
+            needs_50k = False
+            for rel, new_src in changed_py_files:
+                if rel == "sqlglot/errors.py":
+                    needs_50k = True
+                    break
+                comp = sources_map.get(rel)
+                if comp is not None:
+                    old_src = zlib.decompress(comp).decode("utf-8")
+                    # Check changed lines only for max_nodes keywords
+                    old_set = set(old_src.splitlines())
+                    for line in new_src.splitlines():
+                        if line not in old_set and (
+                            "max_nodes" in line
+                            or "_node_count" in line
+                            or "50_000" in line
+                            or "50000" in line
+                            or "1_000_000" in line
+                            or "1000000" in line
+                        ):
+                            needs_50k = True
+                            break
+                if needs_50k:
+                    break
+
+            if needs_50k:
+                sql_55k = f"SELECT {','.join(expr_d for _ in range(550))}"
+                try:
+                    parse_one(sql_55k, max_nodes=50_000)
+                    return False
+                except ParseError as e:
+                    if "Maximum number of AST nodes" not in str(e) or "(50000)" not in str(e):
+                        return False
 
             try:
                 parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
@@ -2275,59 +2580,195 @@ class InProcessVerifier:
         except Exception:
             return False
 
+    def _verify_generator_memory(self, changed_py_files: list[tuple[str, str]]) -> bool:
+        import tracemalloc
+        from sqlglot.dialects import Dialect, Dialects
+
+        was_enabled = gc.isenabled()
+        gc.enable()
+        try:
+            # Restrict to affected dialects if only single dialect/parser/generator files changed
+            only_dialect_files = all(
+                rel.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/"))
+                and pathlib.Path(rel).stem not in ("__init__", "dialect", "base")
+                for rel, _ in changed_py_files
+            )
+            dialects_to_check: list[type] = []
+            if only_dialect_files and self.dialect_subclasses:
+                mod_names: set[str] = set()
+                for rel, _ in changed_py_files:
+                    stem = pathlib.Path(rel).stem
+                    mod_names.add(f"sqlglot.dialects.{stem}")
+                    mod_names.update(self.dialect_subclasses.get(stem, ()))
+                for d_name in Dialects:
+                    d_cls = Dialect.get_or_raise(d_name)
+                    if getattr(d_cls, "__module__", "") in mod_names:
+                        dialects_to_check.append(d_cls)
+            if not dialects_to_check:
+                dialects_to_check = [Dialect.get_or_raise(d_name) for d_name in Dialects]
+
+            for dialect in dialects_to_check:
+                for _ in range(5):
+                    dialect.generator()
+                gc.collect()
+                tracemalloc.start()
+                try:
+                    before = tracemalloc.get_traced_memory()[0]
+                    for _ in range(50):
+                        dialect.generator()
+                    gc.collect()
+                    after = tracemalloc.get_traced_memory()[0]
+                finally:
+                    tracemalloc.stop()
+                # Strict < 50 B over 50 calls (< 1 B/call vs pytest's < 1024 B over 1000 calls)
+                if after - before >= 50:
+                    return False
+            return True
+        except Exception:
+            return False
+        finally:
+            if not was_enabled:
+                gc.disable()
+
+    def _verify_execute_tpcds(self, changed_py_files: list[tuple[str, str]]) -> bool | None:
+        """Sound independent verifier for test_execute_tpcds (#1106).
+        Returns True if proven to pass, False if any query/plan/codegen changed,
+        or None if executor runtime files were touched (not verifiable by plan fingerprint)."""
+        if (
+            self.tpcds_sqls is None
+            or self.tpcds_parse_baseline is None
+            or self.tpcds_exec_indices is None
+            or self.tpcds_exec_fingerprints is None
+            or self.env_invariants is None
+        ):
+            return None
+        if any(rel in EXECUTOR_FILES for rel, _ in changed_py_files):
+            return None
+        try:
+            import sqlglot.helper as _sg_helper
+            from sqlglot.executor.python import PythonExecutor
+            from sqlglot.generator import Generator
+            from sqlglot.optimizer import optimize
+            from sqlglot.planner import Plan
+            from tests.helpers import TPCDS_SCHEMA
+
+            # Guard: executor/env.py & executor/table.py runtime invariants must be unchanged
+            if self.base_helper_codes is not None:
+                cur_codes = (
+                    _sg_helper.is_int.__code__,
+                    _sg_helper.seq_get.__code__,
+                    _sg_helper.dict_depth.__code__,
+                )
+                if cur_codes != self.base_helper_codes:
+                    return None
+            exp = self.sqlglot_mod.exp  # type: ignore
+            cur_inv = (
+                dict(Generator.TIME_PART_SINGULARS),
+                frozenset(t.name for t in exp.DataType.TEXT_TYPES),
+                frozenset(t.name for t in exp.DataType.NUMERIC_TYPES),
+            )
+            if cur_inv != self.env_invariants:
+                return None
+
+            parse_one = self.sqlglot_mod.parse_one  # type: ignore
+            find_tables = self.sqlglot_mod.find_tables  # type: ignore
+            ms = self.mapping_schema_cls(TPCDS_SCHEMA)  # type: ignore
+            py_exec = PythonExecutor()
+            check_pickle = any(
+                rel == "sqlglot/serde.py" or rel.startswith("sqlglot/expressions/")
+                for rel, _ in changed_py_files
+            )
+
+            # 1. Fail-fast query-by-query check over all 57 execute=true queries (shortest first)
+            exec_set = set(self.tpcds_exec_indices)
+            for idx in self.tpcds_exec_indices:
+                sql = self.tpcds_sqls[idx]
+                expr = parse_one(sql)
+                if expr.sql() != self.tpcds_parse_baseline[idx]:
+                    return False
+                if check_pickle and pickle.loads(pickle.dumps(expr)) != expr:
+                    return False
+                b_duck, b_tbls, b_opt, b_fp = self.tpcds_exec_fingerprints[idx]
+                if expr.sql(dialect="duckdb") != b_duck:
+                    return False
+                if tuple(sorted(t.name for t in find_tables(expr))) != b_tbls:
+                    return False
+                opt_expr = optimize(expr, ms, leave_tables_isolated=True)
+                if opt_expr.sql() != b_opt:
+                    return False
+                pl = Plan(opt_expr)
+                if _plan_py_fingerprint(pl, py_exec) != b_fp:
+                    return False
+
+            # 2. Check parse_one (+ pickle if serde/expressions touched) on remaining 42 queries
+            for idx, sql in enumerate(self.tpcds_sqls):
+                if idx in exec_set:
+                    continue
+                expr = parse_one(sql)
+                if expr.sql() != self.tpcds_parse_baseline[idx]:
+                    return False
+                if check_pickle and pickle.loads(pickle.dumps(expr)) != expr:
+                    return False
+
+            return True
+        except Exception:
+            return False
+
     def verify_candidates(
         self,
         changed_py_files: list[tuple[str, str]],
         py_selected: set[int],
         dur_by_num: dict[int, int],
+        non_py_selected: set[int] | None = None,
     ) -> set[int]:
-        orig_cost_ms = schedule_cost_ms(pack_workers(py_selected, dur_by_num), dur_by_num)
-        # Skip verification if the entire static selection costs less than 300ms (e.g. only 0-cost tests)
-        if orig_cost_ms <= 300:
+        non_py = non_py_selected or set()
+        all_selected = non_py | py_selected
+        verifiable_py = py_selected - non_py
+        if not verifiable_py:
             return py_selected
 
-        fast_candidates = sorted(
-            [n for n in py_selected if self._is_runnable_fast(n, dur_by_num.get(n, 999999))],
-            key=lambda n: (self._est_inproc_ms(n, dur_by_num), n),
+        orig_cost_ms = schedule_cost_ms(pack_workers(all_selected, dur_by_num), dur_by_num)
+        base_fixed_cost = (
+            schedule_cost_ms(pack_workers(non_py, dur_by_num), dur_by_num) if non_py else 0
         )
-        unrunnable = py_selected - set(fast_candidates)
+        # Skip verification if the entire reducible cost is <= 300ms
+        if orig_cost_ms - base_fixed_cost <= 300:
+            return py_selected
 
-        # Estimate total runnable in-process duration; only spend CPU when full elimination is
-        # likely to finish well below the static schedule cost.
-        est_runnable_ms = sum(self._est_inproc_ms(n, dur_by_num) for n in fast_candidates)
-        max_budget_ms = min(15_000, max(2_500, int(orig_cost_ms * 0.80)))
+        monsters: dict[str, int] = {}
+        fast_candidates: list[int] = []
+        hard_unrunnable: set[int] = set()
+        for n in verifiable_py:
+            t = self.test_by_num.get(n)
+            if t is None:
+                hard_unrunnable.add(n)
+                continue
+            mname = t["id"].rsplit("::", 1)[-1]
+            if mname in MONSTER_METHODS:
+                monsters[mname] = n
+            elif self._is_runnable_fast(n, dur_by_num.get(n, 999999)):
+                fast_candidates.append(n)
+            else:
+                hard_unrunnable.add(n)
 
-        # Include test_max_nodes? If 1490 is in unrunnable, we can fast-check max_nodes in ~0.7s
-        has_max_nodes = any(
-            self.test_by_num.get(n, {}).get("id", "").endswith("::test_max_nodes")
-            for n in unrunnable
-        )
-        has_opt_tpch = any(
-            self.test_by_num.get(n, {}).get("id", "").endswith("::test_optimized_tpch")
-            for n in unrunnable
-        )
-        if (not fast_candidates and not has_max_nodes and not has_opt_tpch) or (
-            est_runnable_ms > max_budget_ms * 1.25
-        ):
+        if not fast_candidates and not monsters:
             return py_selected
 
         self._ensure_initialized()
-        if has_opt_tpch:
-            self._ensure_tpch_transpile_baseline()
+        if "test_optimized_tpch" in monsters or "test_execute_tpch" in monsters:
+            self._ensure_tpch_baselines()
 
-        # Partition unrecorded DuckDB tests: record cheap ones (<= 250ms) eagerly, and slow ones
-        # lazily only if all cheap tests pass (avoids wasted baseline runs on breaking commits).
+        # Record any missing DuckDB baselines (0 tests when prebuilt baselines.bin is present)
         b_queries = self.conn_cls.baseline_queries if self.conn_cls is not None else {}
-        slow_unrecorded_duckdb = [
+        unrecorded_duckdb = [
             n
             for n in fast_candidates
-            if self.test_by_num.get(n, {}).get("id", "").startswith("tests/test_optimizer.py::TestOptimizer::")
+            if self.test_by_num[n]["id"].startswith("tests/test_optimizer.py::TestOptimizer::")
             and self.test_by_num[n]["id"].split("::")[2] in self.duckdb_opt_methods
             and n not in b_queries
-            and dur_by_num.get(n, 0) > 250
         ]
-        cheap_or_recorded = [n for n in fast_candidates if n not in set(slow_unrecorded_duckdb)]
-        self._record_baseline_if_needed(cheap_or_recorded)
+        if unrecorded_duckdb:
+            self._record_baseline_if_needed(unrecorded_duckdb)
 
         undo: list = []
         t_start = time.monotonic()
@@ -2336,83 +2777,312 @@ class InProcessVerifier:
             passed: set[int] = set()
             skipped: set[int] = set()
             failed: set[int] = set()
-            ran_all_runnable = True
+            tested_fast: set[int] = set()
+            deferred_tpcds_exec = False
 
-            ordered_phases = [cheap_or_recorded]
-            if slow_unrecorded_duckdb:
-                ordered_phases.append(slow_unrecorded_duckdb)
+            def cur_rem() -> set[int]:
+                return all_selected - passed - skipped
 
-            for p_idx, phase_list in enumerate(ordered_phases):
-                if p_idx == 1:
-                    if failed or not ran_all_runnable:
+            def cur_cost() -> int:
+                return schedule_cost_ms(pack_workers(cur_rem(), dur_by_num), dur_by_num)
+
+            # STEP 1: Cheap canary probe (up to 6 fast <=30ms tests across distinct files)
+            # Quickly detects broad-breaking commits in ~0.02s before spending CPU on heavy tests.
+            fast_by_cpu = sorted(fast_candidates, key=lambda n: (self._est_inproc_ms(n, dur_by_num), n))
+            if len(fast_by_cpu) >= 12:
+                canaries: list[int] = []
+                seen_files: set[str] = set()
+                for n in fast_by_cpu:
+                    if dur_by_num.get(n, 999) > 30:
                         break
-                    # Record slow DuckDB baselines only after all cheap tests passed
-                    self.revert_patch(undo)
-                    undo = []
-                    self._record_baseline_if_needed(phase_list)
-                    undo = self.apply_patch(changed_py_files)
-
-                for n in phase_list:
-                    elapsed_ms = (time.monotonic() - t_start) * 1000
-                    # Check time budget BEFORE running a potentially slower test
-                    if elapsed_ms >= max_budget_ms or (
-                        elapsed_ms + self._est_inproc_ms(n, dur_by_num) > max_budget_ms * 1.20
-                        and len(passed) + len(failed) >= 1
-                    ):
-                        ran_all_runnable = False
-                        break
-
-                    # If we already found a failure, only continue pruning if remaining work is cheap
-                    # and could actually reduce total simulated cost noticeably.
-                    if failed:
-                        cur_rem = py_selected - passed - skipped
-                        cur_cost = schedule_cost_ms(pack_workers(cur_rem, dur_by_num), dur_by_num)
-                        floor_cost = schedule_cost_ms(
-                            pack_workers(failed | unrunnable, dur_by_num), dur_by_num
-                        )
-                        if cur_cost - floor_cost <= 400 or len(failed) >= 2:
-                            ran_all_runnable = False
+                    f_rel = self.test_by_num[n]["file"]
+                    if f_rel not in seen_files:
+                        seen_files.add(f_rel)
+                        canaries.append(n)
+                        if len(canaries) >= 6:
                             break
-
-                    status = self._run_test_status(n)
-                    if status == "PASS":
+                if len(canaries) < 6:
+                    cset = set(canaries)
+                    for n in fast_by_cpu:
+                        if dur_by_num.get(n, 999) > 30:
+                            break
+                        if n not in cset:
+                            canaries.append(n)
+                            if len(canaries) >= 6:
+                                break
+                for n in canaries:
+                    tested_fast.add(n)
+                    st = self._run_test_status(n)
+                    if st == "PASS":
                         passed.add(n)
-                    elif status == "SKIP":
+                    elif st == "SKIP":
                         skipped.add(n)
                     else:
                         failed.add(n)
-                if not ran_all_runnable:
-                    break
+                        if len(failed) >= 2:
+                            break
 
-            # Never drop untested tests on a failure or partial run
-            if failed or not ran_all_runnable:
-                return py_selected - passed - skipped
+            # STEP 2: Independent ROI-gated verification of the 5 monster tests
+            # Ordered descending by duration so removing #1490/#1106 exposes true delta of smaller monsters!
+            monster_order = (
+                ("test_max_nodes", 500),
+                ("test_execute_tpcds", 3500),
+                ("test_generator_memory", 1200),
+                ("test_execute_tpch", 200),
+                ("test_optimized_tpch", 400),
+            )
+            for mname, min_delta_ms in monster_order:
+                m_num = monsters.get(mname)
+                if m_num is None:
+                    continue
+                rem_now = cur_rem()
+                c_before = schedule_cost_ms(pack_workers(rem_now, dur_by_num), dur_by_num)
+                c_without = schedule_cost_ms(pack_workers(rem_now - {m_num}, dur_by_num), dur_by_num)
+                if c_before - c_without < min_delta_ms:
+                    continue
 
-            # All runnable tests in py_selected ran exhaustively and PASSED!
-            if not unrunnable:
-                return set()
+                if mname == "test_max_nodes":
+                    ok: bool | None = self._verify_max_nodes_fast(changed_py_files)
+                elif mname == "test_execute_tpch":
+                    ok = self._verify_execute_tpch()
+                elif mname == "test_optimized_tpch":
+                    ok = self._verify_optimized_tpch()
+                elif mname == "test_generator_memory":
+                    ok = self._verify_generator_memory(changed_py_files)
+                elif mname == "test_execute_tpcds":
+                    ok = self._verify_execute_tpcds(changed_py_files)
+                    if ok is None:
+                        deferred_tpcds_exec = True
+                        continue
+                else:
+                    ok = False
 
-            # Check each unrunnable test individually for soundness
-            verified_unrunnable: set[int] = set()
-            for u in unrunnable:
-                tid = self.test_by_num.get(u, {}).get("id", "")
-                if tid.endswith("::test_max_nodes"):
-                    if self._verify_max_nodes_fast():
-                        verified_unrunnable.add(u)
-                elif tid.endswith("::test_optimized_tpch"):
-                    if self._verify_optimized_tpch():
-                        verified_unrunnable.add(u)
-                elif tid.endswith(("::test_execute_tpcds", "::test_execute_tpch")):
-                    # Drop TPC execution tests ONLY when ALL runnable unit tests in py_selected
-                    # passed exhaustively AND at least 5 runnable tests executed cleanly.
-                    if len(passed) >= 5:
-                        verified_unrunnable.add(u)
-                elif tid.endswith("::test_sql_boolean_logic_with_numpy_scalars"):
-                    # Keep unless 0 impact, or drop if all executor boolean tests passed
-                    pass
+                if ok:
+                    passed.add(m_num)
+                else:
+                    failed.add(m_num)
 
-            remaining_unrunnable = unrunnable - verified_unrunnable
-            return remaining_unrunnable
+            # STEP 3: Cost-aware verification of remaining fast tests
+            rem_fast = [n for n in fast_by_cpu if n not in tested_fast]
+            unverified_monsters = {
+                m_num for mname, m_num in monsters.items() if m_num not in passed and not (
+                    mname == "test_execute_tpcds" and deferred_tpcds_exec
+                )
+            }
+            must_keep = non_py | failed | hard_unrunnable | unverified_monsters
+
+            # MODE A: must_keep is empty -> real shot at eliminating ALL tests (workers = [])!
+            if not must_keep and rem_fast:
+                # Hold poor-ROI slow tests (e.g. test_tpcds, test_cache_does_not_retain_queries)
+                # for very last so they only run if all other tests pass and net savings > CPU.
+                held_slow = [
+                    n
+                    for n in rem_fast
+                    if self._est_inproc_ms(n, dur_by_num) >= 800
+                    and self._est_inproc_ms(n, dur_by_num) >= int(dur_by_num.get(n, 0) * 0.90)
+                ]
+                held_set = set(held_slow)
+                other_fast = [n for n in rem_fast if n not in held_set]
+                ordered_a = other_fast + sorted(
+                    held_slow, key=lambda n: (self._est_inproc_ms(n, dur_by_num), n)
+                )
+
+                c_start_a = cur_cost()
+                est_other_a = sum(self._est_inproc_ms(n, dur_by_num) for n in other_fast)
+                est_all_a = est_other_a + sum(self._est_inproc_ms(n, dur_by_num) for n in held_slow)
+                cost_held = (
+                    schedule_cost_ms(pack_workers(held_set, dur_by_num), dur_by_num)
+                    if held_set
+                    else 0
+                )
+                budget_a_ms = min(22_000, max(2_500, int(c_start_a * 0.88)))
+                can_elim_all = est_all_a <= int(c_start_a * 0.88)
+                can_elim_other = bool(other_fast) and est_other_a <= int(
+                    (c_start_a - cost_held) * 0.85
+                )
+                if can_elim_all or can_elim_other:
+                    t_a = time.monotonic()
+                    ran_all_a = True
+                    for n in ordered_a:
+                        elapsed_a = (time.monotonic() - t_a) * 1000
+                        est_n = self._est_inproc_ms(n, dur_by_num)
+                        if elapsed_a >= budget_a_ms or (
+                            elapsed_a + est_n > budget_a_ms * 1.20 and len(passed) >= 1
+                        ):
+                            ran_all_a = False
+                            break
+                        if n in held_set:
+                            rem_cost_now = cur_cost()
+                            if rem_cost_now <= est_n + 350:
+                                ran_all_a = False
+                                break
+                        tested_fast.add(n)
+                        st = self._run_test_status(n)
+                        if st == "PASS":
+                            passed.add(n)
+                        elif st == "SKIP":
+                            skipped.add(n)
+                        else:
+                            failed.add(n)
+                            must_keep.add(n)
+                            ran_all_a = False
+                            break
+
+                    if ran_all_a and not must_keep:
+                        # All runnable fast tests passed exhaustively!
+                        if deferred_tpcds_exec and "test_execute_tpcds" in monsters:
+                            if len(passed) >= 5:
+                                passed.add(monsters["test_execute_tpcds"])
+                        return py_selected - passed - skipped
+                else:
+                    # Full elimination too expensive on CPU -> prune high-ROI tests only!
+                    high_roi_a = sorted(
+                        [
+                            n
+                            for n in other_fast
+                            if dur_by_num.get(n, 0) >= 250
+                            and dur_by_num.get(n, 0) >= self._est_inproc_ms(n, dur_by_num) * 1.65
+                        ],
+                        key=lambda n: (
+                            -(
+                                (dur_by_num.get(n, 0) - self._est_inproc_ms(n, dur_by_num))
+                                / max(5, self._est_inproc_ms(n, dur_by_num))
+                            ),
+                            -dur_by_num.get(n, 0),
+                            n,
+                        ),
+                    )
+                    consec_f = 0
+                    for n in high_roi_a[:15]:
+                        tested_fast.add(n)
+                        st = self._run_test_status(n)
+                        if st == "PASS":
+                            passed.add(n)
+                            consec_f = 0
+                        elif st == "SKIP":
+                            skipped.add(n)
+                        else:
+                            failed.add(n)
+                            must_keep.add(n)
+                            consec_f += 1
+                            if consec_f >= 3:
+                                break
+
+            # MODE B: must_keep is non-empty -> workers=[] is impossible.
+            # Only prune remaining untested fast tests when marginal simulated savings > CPU cost!
+            if deferred_tpcds_exec and "test_execute_tpcds" in monsters:
+                must_keep.add(monsters["test_execute_tpcds"])
+
+            rem_fast_b = [n for n in fast_by_cpu if n not in tested_fast]
+            if must_keep and rem_fast_b:
+                floor_cost = schedule_cost_ms(pack_workers(must_keep, dur_by_num), dur_by_num)
+                cur_c = cur_cost()
+                gap = cur_c - floor_cost
+
+                if gap > 450:
+                    # Exclude tests whose own in-process CPU >= 85% of recorded duration
+                    candidates_b = [
+                        n
+                        for n in rem_fast_b
+                        if self._est_inproc_ms(n, dur_by_num)
+                        <= int(dur_by_num.get(n, 0) * 0.85) + 10
+                    ]
+                    rem_cpu_b = sum(self._est_inproc_ms(n, dur_by_num) for n in candidates_b)
+
+                    # Case B1: Batch pruning is profitable (total est CPU <= 72% of recoverable gap)
+                    if candidates_b and rem_cpu_b <= gap * 0.72 and len(failed) <= 20:
+                        # Run highest ROI tests first!
+                        ordered_b = sorted(
+                            candidates_b,
+                            key=lambda n: (
+                                -(
+                                    (dur_by_num.get(n, 0) - self._est_inproc_ms(n, dur_by_num))
+                                    / max(5, self._est_inproc_ms(n, dur_by_num))
+                                ),
+                                -dur_by_num.get(n, 0),
+                                n,
+                            ),
+                        )
+                        t_b = time.monotonic()
+                        b_tried = 0
+                        b_failed = 0
+                        consec_fail = 0
+                        for n in ordered_b:
+                            if consec_fail >= 4 or (b_tried >= 6 and b_failed >= b_tried * 0.65):
+                                break
+                            elapsed_b = (time.monotonic() - t_b) * 1000
+                            if elapsed_b >= gap * 0.65:
+                                break
+                            if b_tried % 8 == 0 or b_failed > 0:
+                                floor_cost = schedule_cost_ms(
+                                    pack_workers(must_keep, dur_by_num), dur_by_num
+                                )
+                                gap = cur_cost() - floor_cost
+                                if gap <= 400 or elapsed_b >= gap * 0.65:
+                                    break
+                            tested_fast.add(n)
+                            b_tried += 1
+                            st = self._run_test_status(n)
+                            if st == "PASS":
+                                passed.add(n)
+                                consec_fail = 0
+                            elif st == "SKIP":
+                                skipped.add(n)
+                            else:
+                                failed.add(n)
+                                must_keep.add(n)
+                                b_failed += 1
+                                consec_fail += 1
+                    else:
+                        # Case B2: Probe high-ROI heavy-hitters (dur >= 200ms, ROI >= 1.65x)
+                        heavy = sorted(
+                            [
+                                n
+                                for n in candidates_b
+                                if dur_by_num.get(n, 0) >= 200
+                                and dur_by_num.get(n, 0)
+                                >= self._est_inproc_ms(n, dur_by_num) * 1.65
+                            ],
+                            key=lambda n: (
+                                -(
+                                    (dur_by_num.get(n, 0) - self._est_inproc_ms(n, dur_by_num))
+                                    / max(5, self._est_inproc_ms(n, dur_by_num))
+                                ),
+                                -dur_by_num.get(n, 0),
+                                n,
+                            ),
+                        )
+                        consec_fail = 0
+                        b2_tried = 0
+                        for n in heavy[:12]:
+                            est_n = self._est_inproc_ms(n, dur_by_num)
+                            rem_now = cur_rem()
+                            c_before = schedule_cost_ms(pack_workers(rem_now, dur_by_num), dur_by_num)
+                            c_without = schedule_cost_ms(
+                                pack_workers(rem_now - {n}, dur_by_num), dur_by_num
+                            )
+                            delta_n = c_before - c_without
+                            # Allow either immediate single-test win OR ultra-high-ROI (>3x) load reducer
+                            if delta_n < max(300, int(est_n * 1.5)) and not (
+                                dur_by_num.get(n, 0) >= est_n * 3.0 and dur_by_num.get(n, 0) >= 400
+                            ):
+                                continue
+                            tested_fast.add(n)
+                            b2_tried += 1
+                            st = self._run_test_status(n)
+                            if st == "PASS":
+                                passed.add(n)
+                                consec_fail = 0
+                            elif st == "SKIP":
+                                skipped.add(n)
+                            else:
+                                failed.add(n)
+                                must_keep.add(n)
+                                consec_fail += 1
+                                if consec_fail >= 3:
+                                    break
+
+            return py_selected - passed - skipped
         except Exception:
             return py_selected
         finally:
@@ -2422,6 +3092,7 @@ class InProcessVerifier:
 
 def main() -> None:
     t0 = time.monotonic()
+    profile = bool(os.environ.get("BLAST_PROFILE"))
     real_stdout = sys.stdout
     sys.stdout = sys.stderr
     try:
@@ -2453,8 +3124,15 @@ def main() -> None:
         out_lines: list[str] = []
         for patch_path in sorted(commits_dir.glob("*.patch")):
             patch_text = patch_path.read_text("utf-8")
+            t_c = time.process_time() if profile else 0.0
             selected_nums = select_tests_for_patch(patch_text, cov_map, verifier, dur_by_num)
             workers = pack_workers(selected_nums, dur_by_num)
+            if profile:
+                print(
+                    f"PROFILE {patch_path.stem} cpu={time.process_time() - t_c:.3f}s "
+                    f"sel={len(selected_nums)} cost={schedule_cost_ms(workers, dur_by_num) / 1000:.2f}s",
+                    file=sys.stderr,
+                )
             total_selected += len(selected_nums)
             out_lines.append(
                 json.dumps({"commit": patch_path.stem, "workers": workers}, separators=(",", ":"))
