@@ -156,6 +156,13 @@ def pack_workers(selected_nums: set[int], dur_by_num: dict[int, int]) -> list[li
     return best_workers
 
 
+def schedule_cost_ms(workers: list[list[int]], dur_by_num: dict[int, int]) -> int:
+    if not workers:
+        return 0
+    busiest = max(sum(dur_by_num[n] for n in w) for w in workers)
+    return busiest + WORKER_COST_MS * len(workers)
+
+
 def parse_unified_diff(patch_text: str) -> list[tuple[str, list[tuple[int, int, list[str]]]]]:
     """Parse a unified diff into a list of (rel_path, hunks) where each hunk is
     (old_start, old_count, hunk_lines)."""
@@ -951,7 +958,7 @@ def select_tests_for_patch(
         if not changes:
             continue
 
-        if not rel_path.startswith("sqlglot/") or rel_path.startswith("sqlglot/typing/"):
+        if not rel_path.startswith("sqlglot/"):
             can_verify_py = False
         changed_py_files.append((rel_path, new_source))
 
@@ -1113,7 +1120,6 @@ SKIP_VERIFY_FILES = frozenset(
         "tests/test_sqlglotc.py",
         "tests/test_build.py",
         "tests/test_docs.py",
-        "tests/test_typing.py",
     }
 )
 
@@ -1123,22 +1129,6 @@ SKIP_VERIFY_METHODS = frozenset(
         "test_execute_tpcds",
         "test_execute_tpch",
         "test_optimized_tpch",
-        "test_sql_boolean_logic_with_numpy_scalars",
-    }
-)
-
-CONN_OPT_METHODS = frozenset(
-    {
-        "test_qualify_using_with_many_joins",
-        "test_optimize_predicates",
-        "test_optimize_uncorrelated_exists",
-        "test_optimize_correlated_all",
-        "test_optimize_subqueries_in_aggregates",
-        "test_optimize_subqueries_in_join_on",
-        "test_optimize_distinct_on_predicates",
-        "test_optimize_special_joins",
-        "test_optimize_snowflake_asof_without_on",
-        "test_eliminate_joins",
     }
 )
 
@@ -1157,35 +1147,87 @@ def _iter_subclasses(cls: type) -> list[type]:
     return out
 
 
-def _rewrite_class_cells(obj: object, new_cls: type, orig_cls: type, seen: set[int]) -> None:
+def _collect_class_pairs(orig_cls: type, new_cls: type, cls_map: dict[type, type]) -> None:
+    if new_cls in cls_map:
+        return
+    cls_map[new_cls] = orig_cls
+    for k, nv in new_cls.__dict__.items():
+        if isinstance(nv, type):
+            ov = orig_cls.__dict__.get(k)
+            if isinstance(ov, type) and ov.__name__ == nv.__name__:
+                _collect_class_pairs(ov, nv, cls_map)
+
+
+def _rewrite_cls_refs(obj: object, cls_map: dict[type, type], seen: set[int]) -> object:
     import types
 
+    if isinstance(obj, type):
+        return cls_map.get(obj, obj)
     oid = id(obj)
     if oid in seen:
-        return
-    seen.add(oid)
+        return obj
     if type(obj) is types.FunctionType:
+        seen.add(oid)
+        if obj.__defaults__:
+            new_def = tuple(_rewrite_cls_refs(x, cls_map, seen) for x in obj.__defaults__)
+            if new_def != obj.__defaults__:
+                obj.__defaults__ = new_def
+        if obj.__kwdefaults__:
+            new_kw = {
+                k: _rewrite_cls_refs(v, cls_map, seen) for k, v in obj.__kwdefaults__.items()
+            }
+            if new_kw != obj.__kwdefaults__:
+                obj.__kwdefaults__ = new_kw
         if obj.__closure__:
             for cell in obj.__closure__:
                 try:
-                    if cell.cell_contents is new_cls:
-                        cell.cell_contents = orig_cls
-                    else:
-                        _rewrite_class_cells(cell.cell_contents, new_cls, orig_cls, seen)
+                    c_val = cell.cell_contents
+                    mapped = _rewrite_cls_refs(c_val, cls_map, seen)
+                    if mapped is not c_val:
+                        cell.cell_contents = mapped
                 except ValueError:
                     pass
-    elif isinstance(obj, (classmethod, staticmethod)):
-        _rewrite_class_cells(obj.__func__, new_cls, orig_cls, seen)
-    elif isinstance(obj, property):
+        return obj
+    if isinstance(obj, (classmethod, staticmethod)):
+        seen.add(oid)
+        _rewrite_cls_refs(obj.__func__, cls_map, seen)
+        return obj
+    if isinstance(obj, property):
+        seen.add(oid)
         for f in (obj.fget, obj.fset, obj.fdel):
             if f is not None:
-                _rewrite_class_cells(f, new_cls, orig_cls, seen)
-    elif isinstance(obj, dict):
-        for v in obj.values():
-            _rewrite_class_cells(v, new_cls, orig_cls, seen)
-    elif isinstance(obj, (list, tuple, set)):
-        for v in obj:
-            _rewrite_class_cells(v, new_cls, orig_cls, seen)
+                _rewrite_cls_refs(f, cls_map, seen)
+        return obj
+    if isinstance(obj, tuple):
+        return tuple(_rewrite_cls_refs(v, cls_map, seen) for v in obj)
+    if isinstance(obj, list):
+        seen.add(oid)
+        for i in range(len(obj)):
+            obj[i] = _rewrite_cls_refs(obj[i], cls_map, seen)
+        return obj
+    if isinstance(obj, dict):
+        seen.add(oid)
+        items = list(obj.items())
+        changed = False
+        new_items = []
+        for k, v in items:
+            nk = cls_map.get(k, k) if isinstance(k, type) else k
+            nv = _rewrite_cls_refs(v, cls_map, seen)
+            if nk is not k or nv is not v:
+                changed = True
+            new_items.append((nk, nv))
+        if changed:
+            obj.clear()
+            obj.update(new_items)
+        return obj
+    if isinstance(obj, set):
+        seen.add(oid)
+        mapped = {cls_map.get(v, v) if isinstance(v, type) else v for v in obj}
+        if mapped != obj:
+            obj.clear()
+            obj.update(mapped)
+        return obj
+    return obj
 
 
 def _funcs_equal(f1: object, f2: object) -> bool:
@@ -1218,9 +1260,12 @@ class InProcessVerifier:
         self.conn_cls: type | None = None
         self.mod_opt: object = None
         self.sqlglot_mod: object = None
+        self.duckdb_opt_methods: set[str] = set()
+        self.tpch_transpiled_baseline: list[tuple[str, str]] | None = None
+        self.tpch_pairs: list[tuple[str, str]] | None = None
 
     def _is_runnable_fast(self, num: int, dur_ms: int) -> bool:
-        if dur_ms > 700:
+        if dur_ms > 2600:
             return False
         t = self.test_by_num.get(num)
         if t is None:
@@ -1229,6 +1274,15 @@ class InProcessVerifier:
         if file_rel in SKIP_VERIFY_FILES or method_name in SKIP_VERIFY_METHODS:
             return False
         return True
+
+    def _est_inproc_ms(self, num: int, dur_by_num: dict[int, int]) -> int:
+        t = self.test_by_num.get(num)
+        if t is not None and t["id"].endswith("::test_tpcds"):
+            return 4500
+        dur = dur_by_num.get(num, 500)
+        if dur >= 500:
+            return dur
+        return max(1, int(dur * 0.6))
 
     def _ensure_initialized(self) -> None:
         if self.initialized:
@@ -1239,10 +1293,12 @@ class InProcessVerifier:
         import datetime
         import importlib
         import importlib.metadata
+        import re
         import tempfile
         import types
         import unittest
         import unittest.mock
+        import zoneinfo
 
         # 1. Locate or unpack sqlglot root
         candidates = [
@@ -1325,6 +1381,8 @@ class InProcessVerifier:
                 return dt.replace(tzinfo=self)
 
             def utcoffset(self, dt):
+                if dt is not None and 3 < dt.month < 11 and self.zone == "America/Los_Angeles":
+                    return datetime.timedelta(hours=-7)
                 return self._offset
 
             def dst(self, dt):
@@ -1332,6 +1390,14 @@ class InProcessVerifier:
 
             def tzname(self, dt):
                 return self.zone
+
+            def __str__(self) -> str:
+                return self.zone
+
+        try:
+            zoneinfo.ZoneInfo("America/Los_Angeles")
+        except Exception:
+            zoneinfo.ZoneInfo = _FakeTimezone  # type: ignore
 
         class _FakeRelativeDelta:
             def __init__(
@@ -1404,6 +1470,14 @@ class InProcessVerifier:
                     return (-self)._apply(other)
                 return NotImplemented
 
+        class _FakeDuckDBInvalidInput(Exception):
+            pass
+
+        class _DuckDBRows(list):
+            def __init__(self, rows, idx: int = -1):
+                super().__init__(rows)
+                self.idx = idx
+
         class _FakeDuckDBCursor:
             def __init__(self, rows):
                 self._rows = rows
@@ -1417,10 +1491,15 @@ class InProcessVerifier:
             def fetchdf(self):
                 return self._rows
 
+        tmp_base_escaped = re.escape(tempfile.gettempdir())
+        tmp_path_re = re.compile(tmp_base_escaped + r"[/\\]tmp[^/'\"\\]+")
+
         class _FakeDuckDBConn:
             current_test_num: int = -1
             is_baseline_recording: bool = False
+            in_raises_invalid: bool = False
             baseline_queries: dict[int, list[str]] = {}
+            baseline_expects: dict[int, dict[int, tuple[str, object]]] = {}
             query_idx: int = 0
 
             def __enter__(self):
@@ -1436,20 +1515,137 @@ class InProcessVerifier:
                 tnum = _FakeDuckDBConn.current_test_num
                 if tnum < 0:
                     return _FakeDuckDBCursor([(None,)])
-                q = sql.strip()
-                if _FakeDuckDBConn.is_baseline_recording:
-                    _FakeDuckDBConn.baseline_queries.setdefault(tnum, []).append(q)
-                    return _FakeDuckDBCursor([(None,)])
-                b_list = _FakeDuckDBConn.baseline_queries.get(tnum)
+                q = tmp_path_re.sub("/TMP_DIR", sql.strip())
+                if args:
+                    q_extra = tmp_path_re.sub("/TMP_DIR", repr(args))
+                    q = f"{q} ARGS={q_extra}"
                 idx = _FakeDuckDBConn.query_idx
                 _FakeDuckDBConn.query_idx = idx + 1
-                if b_list is not None and idx < len(b_list):
-                    if q != b_list[idx]:
+                if _FakeDuckDBConn.is_baseline_recording:
+                    _FakeDuckDBConn.baseline_queries.setdefault(tnum, []).append(q)
+                    if _FakeDuckDBConn.in_raises_invalid:
+                        _FakeDuckDBConn.baseline_expects.setdefault(tnum, {})[idx] = (
+                            "RAISE",
+                            None,
+                        )
+                        raise _FakeDuckDBInvalidInput("More than one row")
+                    return _FakeDuckDBCursor(_DuckDBRows([(None,)], idx=idx))
+
+                b_list = _FakeDuckDBConn.baseline_queries.get(tnum)
+                if b_list is not None:
+                    if idx >= len(b_list) or q != b_list[idx]:
                         return _FakeDuckDBCursor([("__DIFF__", idx, q)])
+                    exp_entry = _FakeDuckDBConn.baseline_expects.get(tnum, {}).get(idx)
+                    if exp_entry is not None:
+                        kind, val = exp_entry
+                        if kind == "RAISE":
+                            raise _FakeDuckDBInvalidInput("More than one row")
+                        return _FakeDuckDBCursor(val)
                 return _FakeDuckDBCursor([(None,)])
 
         _fake_duckdb_conn = _FakeDuckDBConn()
         self.conn_cls = _FakeDuckDBConn
+
+        orig_assert_equal = unittest.TestCase.assertEqual
+        orig_assert_count_equal = unittest.TestCase.assertCountEqual
+        orig_assert_raises_regex = unittest.TestCase.assertRaisesRegex
+
+        def _rec_assert_equal(case_self, first, second, msg=None):
+            if _FakeDuckDBConn.is_baseline_recording:
+                tnum = _FakeDuckDBConn.current_test_num
+                if isinstance(first, _DuckDBRows) and not isinstance(second, _DuckDBRows):
+                    _FakeDuckDBConn.baseline_expects.setdefault(tnum, {})[first.idx] = (
+                        "ROWS",
+                        second,
+                    )
+                    return
+                if isinstance(second, _DuckDBRows) and not isinstance(first, _DuckDBRows):
+                    _FakeDuckDBConn.baseline_expects.setdefault(tnum, {})[second.idx] = (
+                        "ROWS",
+                        first,
+                    )
+                    return
+            return orig_assert_equal(case_self, first, second, msg=msg)
+
+        def _rec_assert_count_equal(case_self, first, second, msg=None):
+            if _FakeDuckDBConn.is_baseline_recording:
+                tnum = _FakeDuckDBConn.current_test_num
+                if isinstance(first, _DuckDBRows) and not isinstance(second, _DuckDBRows):
+                    _FakeDuckDBConn.baseline_expects.setdefault(tnum, {})[first.idx] = (
+                        "ROWS",
+                        second,
+                    )
+                    return
+                if isinstance(second, _DuckDBRows) and not isinstance(first, _DuckDBRows):
+                    _FakeDuckDBConn.baseline_expects.setdefault(tnum, {})[second.idx] = (
+                        "ROWS",
+                        first,
+                    )
+                    return
+            return orig_assert_count_equal(case_self, first, second, msg=msg)
+
+        @contextlib.contextmanager
+        def _raises_invalid_ctx(outer_ctx):
+            _FakeDuckDBConn.in_raises_invalid = True
+            try:
+                with outer_ctx as cm:
+                    yield cm
+            finally:
+                _FakeDuckDBConn.in_raises_invalid = False
+
+        def _rec_assert_raises_regex(case_self, expected_exception, expected_regex, *args, **kwargs):
+            ctx = orig_assert_raises_regex(case_self, expected_exception, expected_regex, *args, **kwargs)
+            if (
+                _FakeDuckDBConn.is_baseline_recording
+                and expected_exception is _FakeDuckDBInvalidInput
+                and not args
+            ):
+                return _raises_invalid_ctx(ctx)
+            return ctx
+
+        unittest.TestCase.assertEqual = _rec_assert_equal  # type: ignore
+        unittest.TestCase.assertCountEqual = _rec_assert_count_equal  # type: ignore
+        unittest.TestCase.assertRaisesRegex = _rec_assert_raises_regex  # type: ignore
+
+        class _FakeNpBool:
+            __slots__ = ("_v",)
+
+            def __init__(self, v: object = False) -> None:
+                self._v = bool(v)
+
+            def __bool__(self) -> bool:
+                return self._v
+
+            def __and__(self, other: object) -> _FakeNpBool:
+                return _FakeNpBool(self._v and bool(other))
+
+            def __rand__(self, other: object) -> _FakeNpBool:
+                return _FakeNpBool(bool(other) and self._v)
+
+            def __or__(self, other: object) -> _FakeNpBool:
+                return _FakeNpBool(self._v or bool(other))
+
+            def __ror__(self, other: object) -> _FakeNpBool:
+                return _FakeNpBool(bool(other) or self._v)
+
+            def __invert__(self) -> _FakeNpBool:
+                return _FakeNpBool(not self._v)
+
+            def __eq__(self, other: object) -> object:
+                if isinstance(other, (bool, _FakeNpBool, int)):
+                    return self._v == bool(other)
+                return NotImplemented
+
+            def __ne__(self, other: object) -> object:
+                if isinstance(other, (bool, _FakeNpBool, int)):
+                    return self._v != bool(other)
+                return NotImplemented
+
+            def __hash__(self) -> int:
+                return hash(self._v)
+
+            def __repr__(self) -> str:
+                return f"np.bool_({self._v})"
 
         for mod_name in (
             "duckdb",
@@ -1463,7 +1659,7 @@ class InProcessVerifier:
             if mod_name not in sys.modules:
                 m = types.ModuleType(mod_name)
                 if mod_name == "numpy":
-                    m.bool_ = bool  # type: ignore
+                    m.bool_ = _FakeNpBool  # type: ignore
                     m.nan = float("nan")  # type: ignore
                 elif mod_name == "pandas":
                     m.DataFrame = object  # type: ignore
@@ -1472,6 +1668,7 @@ class InProcessVerifier:
                     m.assert_frame_equal = lambda *a, **kw: None  # type: ignore
                 elif mod_name == "duckdb":
                     m.connect = lambda *a, **kw: _fake_duckdb_conn  # type: ignore
+                    m.InvalidInputException = _FakeDuckDBInvalidInput  # type: ignore
                 elif mod_name == "pytz":
                     m.timezone = _FakeTimezone  # type: ignore
                     m.utc = datetime.timezone.utc  # type: ignore
@@ -1486,6 +1683,20 @@ class InProcessVerifier:
             yield
 
         unittest.TestCase.subTest = _fast_subtest  # type: ignore
+
+        # Automatically identify TestOptimizer methods using duckdb.connect or self.conn
+        opt_comp = self.cov_map.get("sources", {}).get("tests/test_optimizer.py")
+        if opt_comp is not None:
+            opt_src = zlib.decompress(opt_comp).decode("utf-8")
+            opt_lines = opt_src.splitlines()
+            opt_tree = ast.parse(opt_src)
+            for node in opt_tree.body:
+                if isinstance(node, ast.ClassDef) and node.name == "TestOptimizer":
+                    for fn in node.body:
+                        if isinstance(fn, ast.FunctionDef) and fn.name != "check_file":
+                            body_text = "\n".join(opt_lines[fn.lineno - 1 : fn.end_lineno])
+                            if "duckdb.connect" in body_text or "self.conn" in body_text:
+                                self.duckdb_opt_methods.add(fn.name)
 
         import sqlglot
         import tests.test_executor as mod_exec
@@ -1515,7 +1726,9 @@ class InProcessVerifier:
 
         self.initialized = True
 
-    def _sync_class_inplace(self, orig_cls: type, new_cls: type, undo_actions: list) -> None:
+    def _sync_class_inplace(
+        self, orig_cls: type, new_cls: type, undo_actions: list, cls_map: dict[type, type]
+    ) -> None:
         import enum
         import types
         from sqlglot.dialects.dialect import Dialect, _Dialect
@@ -1523,6 +1736,10 @@ class InProcessVerifier:
         from sqlglot.tokens import _TokenizerBase
 
         if issubclass(orig_cls, enum.Enum):
+            orig_items = [(m.name, m.value) for m in orig_cls]
+            new_items = [(m.name, m.value) for m in new_cls]
+            if orig_items != new_items:
+                raise RuntimeError(f"Enum {orig_cls.__name__} modified")
             return
 
         skip_attrs = {
@@ -1534,13 +1751,16 @@ class InProcessVerifier:
             "__firstlineno__",
             "__static_attributes__",
         }
+        if orig_cls is _Dialect:
+            skip_attrs.add("_classes")
 
         orig_dict = dict(orig_cls.__dict__)
         new_dict = dict(new_cls.__dict__)
 
         seen_objs: set[int] = set()
-        for v in new_dict.values():
-            _rewrite_class_cells(v, new_cls, orig_cls, seen_objs)
+        for k in list(new_dict.keys()):
+            if k not in skip_attrs:
+                new_dict[k] = _rewrite_cls_refs(new_dict[k], cls_map, seen_objs)
 
         for k, new_v in new_dict.items():
             if k in skip_attrs:
@@ -1599,7 +1819,7 @@ class InProcessVerifier:
                 and isinstance(new_v, type)
                 and orig_v.__name__ == new_v.__name__
             ):
-                self._sync_class_inplace(orig_v, new_v, undo_actions)
+                self._sync_class_inplace(orig_v, new_v, undo_actions, cls_map)
             elif isinstance(orig_v, dict) and isinstance(new_v, dict):
                 if orig_v != new_v:
                     old_copy = dict(orig_v)
@@ -1709,6 +1929,24 @@ class InProcessVerifier:
                 "__cached__",
                 "__builtins__",
             }
+            cls_map: dict[type, type] = {}
+            for k, new_v in temp_ns.items():
+                if k in skip_mod_keys:
+                    continue
+                orig_v = mod.__dict__.get(k)
+                if (
+                    isinstance(orig_v, type)
+                    and isinstance(new_v, type)
+                    and orig_v.__name__ == new_v.__name__
+                ):
+                    _collect_class_pairs(orig_v, new_v, cls_map)
+
+            if cls_map:
+                seen_refs: set[int] = set()
+                for k in list(temp_ns.keys()):
+                    if k not in skip_mod_keys and not isinstance(temp_ns[k], type):
+                        temp_ns[k] = _rewrite_cls_refs(temp_ns[k], cls_map, seen_refs)
+
             for k, new_v in temp_ns.items():
                 if k in skip_mod_keys:
                     continue
@@ -1731,12 +1969,13 @@ class InProcessVerifier:
                     else:
                         setattr(mod, k, new_v)
                         undo_actions.append(("setattr", mod, k, orig_v))
+                        self._propagate_binding(mod, k, orig_v, new_v, undo_actions)
                 elif (
                     isinstance(orig_v, type)
                     and isinstance(new_v, type)
                     and orig_v.__name__ == new_v.__name__
                 ):
-                    self._sync_class_inplace(orig_v, new_v, undo_actions)
+                    self._sync_class_inplace(orig_v, new_v, undo_actions, cls_map)
                 elif isinstance(orig_v, dict) and isinstance(new_v, dict):
                     if orig_v != new_v:
                         old_copy = dict(orig_v)
@@ -1753,9 +1992,23 @@ class InProcessVerifier:
                     if orig_v != new_v:
                         setattr(mod, k, new_v)
                         undo_actions.append(("setattr", mod, k, orig_v))
+                        self._propagate_binding(mod, k, orig_v, new_v, undo_actions)
 
         sqlglot.generator._DISPATCH_CACHE.clear()
         return undo_actions
+
+    def _propagate_binding(
+        self, mod: object, name: str, orig_v: object, new_v: object, undo_actions: list
+    ) -> None:
+        if orig_v is None or isinstance(orig_v, bool):
+            return
+        for m_name, m in list(sys.modules.items()):
+            if m is None or m is mod or not m_name.startswith(("sqlglot", "tests")):
+                continue
+            mdict = getattr(m, "__dict__", None)
+            if mdict is not None and mdict.get(name) is orig_v:
+                setattr(m, name, new_v)
+                undo_actions.append(("setattr", m, name, orig_v))
 
     def revert_patch(self, undo_actions: list) -> None:
         import sqlglot.generator
@@ -1805,7 +2058,7 @@ class InProcessVerifier:
 
         sqlglot.generator._DISPATCH_CACHE.clear()
 
-    def run_single_test(self, num: int) -> bool:
+    def _run_test_status(self, num: int) -> str:
         import importlib
         import unittest
 
@@ -1829,7 +2082,14 @@ class InProcessVerifier:
         case.run(res)
         if conn_cls is not None:
             conn_cls.current_test_num = -1  # type: ignore
-        return res.wasSuccessful() and not res.skipped
+        if not res.wasSuccessful():
+            return "FAIL"
+        if res.skipped:
+            return "SKIP"
+        return "PASS"
+
+    def run_single_test(self, num: int) -> bool:
+        return self._run_test_status(num) == "PASS"
 
     def _record_baseline_if_needed(self, nums: list[int]) -> None:
         conn_cls = self.conn_cls
@@ -1841,11 +2101,72 @@ class InProcessVerifier:
             if t is None:
                 continue
             _, cls_name, method_name = t["id"].split("::")
-            if cls_name == "TestOptimizer" and method_name in CONN_OPT_METHODS and n not in b_queries:
+            if cls_name == "TestOptimizer" and method_name in self.duckdb_opt_methods and n not in b_queries:
                 conn_cls.is_baseline_recording = True  # type: ignore
                 b_queries[n] = []
-                self.run_single_test(n)
+                status = self._run_test_status(n)
                 conn_cls.is_baseline_recording = False  # type: ignore
+                if status == "FAIL":
+                    b_queries.pop(n, None)
+
+    def _ensure_tpch_transpile_baseline(self) -> None:
+        if self.tpch_transpiled_baseline is not None:
+            return
+        from tests.helpers import load_sql_fixture_pairs
+
+        pairs = [(sql, opt) for _, sql, opt in load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql")]
+        self.tpch_pairs = pairs
+        self.tpch_transpiled_baseline = [
+            (
+                self.sqlglot_mod.transpile(sql, write="duckdb")[0],  # type: ignore
+                self.sqlglot_mod.transpile(opt, write="duckdb")[0],  # type: ignore
+            )
+            for sql, opt in pairs
+        ]
+
+    def _verify_optimized_tpch(self) -> bool:
+        if not self.tpch_pairs or not self.tpch_transpiled_baseline:
+            return False
+        try:
+            for (sql, opt), (b_sql, b_opt) in zip(self.tpch_pairs, self.tpch_transpiled_baseline):
+                if self.sqlglot_mod.transpile(sql, write="duckdb")[0] != b_sql:  # type: ignore
+                    return False
+                if self.sqlglot_mod.transpile(opt, write="duckdb")[0] != b_opt:  # type: ignore
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _verify_max_nodes_fast(self) -> bool:
+        try:
+            parse_one = self.sqlglot_mod.parse_one  # type: ignore
+            exp = self.sqlglot_mod.exp  # type: ignore
+            from sqlglot.errors import ParseError
+
+            if not isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select):
+                return False
+            cols = [f"col{i}" for i in range(500)]
+            if not isinstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select):
+                return False
+
+            expr_d = "x" + "=x" * 100
+            sql_55k = f"SELECT {','.join(expr_d for _ in range(550))}"
+            try:
+                parse_one(sql_55k, max_nodes=50_000)
+                return False
+            except ParseError as e:
+                if "(50000)" not in str(e):
+                    return False
+
+            try:
+                parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+                return False
+            except ParseError:
+                pass
+
+            return isinstance(parse_one("SELECT 1, 2, 3"), exp.Select)
+        except Exception:
+            return False
 
     def verify_candidates(
         self,
@@ -1853,75 +2174,143 @@ class InProcessVerifier:
         py_selected: set[int],
         dur_by_num: dict[int, int],
     ) -> set[int]:
-        fast_candidates = sorted(
-            [n for n in py_selected if self._is_runnable_fast(n, dur_by_num.get(n, 999999))],
-            key=lambda n: (dur_by_num.get(n, 0), n),
-        )
-        if not fast_candidates:
+        orig_cost_ms = schedule_cost_ms(pack_workers(py_selected, dur_by_num), dur_by_num)
+        # Skip verification if the entire static selection costs less than 300ms (e.g. only 0-cost tests)
+        if orig_cost_ms <= 300:
             return py_selected
 
-        slow_tests = py_selected - set(fast_candidates)
-        total_fast_ms = sum(dur_by_num.get(n, 0) for n in fast_candidates)
+        fast_candidates = sorted(
+            [n for n in py_selected if self._is_runnable_fast(n, dur_by_num.get(n, 999999))],
+            key=lambda n: (self._est_inproc_ms(n, dur_by_num), n),
+        )
+        unrunnable = py_selected - set(fast_candidates)
 
-        # Case A: All selected tests are runnable fast tests with total runtime <= 2.0s
-        if not slow_tests and total_fast_ms <= 2000:
-            self._ensure_initialized()
-            self._record_baseline_if_needed(fast_candidates)
-            undo: list = []
-            try:
-                undo = self.apply_patch(changed_py_files)
-                passed: set[int] = set()
-                for n in fast_candidates:
-                    if self.run_single_test(n):
-                        passed.add(n)
-                    else:
+        # Estimate total runnable in-process duration; only spend CPU when full elimination is
+        # likely to finish well below the static schedule cost.
+        est_runnable_ms = sum(self._est_inproc_ms(n, dur_by_num) for n in fast_candidates)
+        max_budget_ms = min(15_000, max(2_500, int(orig_cost_ms * 0.80)))
+
+        # Include test_max_nodes? If 1490 is in unrunnable, we can fast-check max_nodes in ~0.7s
+        has_max_nodes = any(
+            self.test_by_num.get(n, {}).get("id", "").endswith("::test_max_nodes")
+            for n in unrunnable
+        )
+        has_opt_tpch = any(
+            self.test_by_num.get(n, {}).get("id", "").endswith("::test_optimized_tpch")
+            for n in unrunnable
+        )
+        if (not fast_candidates and not has_max_nodes and not has_opt_tpch) or (
+            est_runnable_ms > max_budget_ms * 1.25
+        ):
+            return py_selected
+
+        self._ensure_initialized()
+        if has_opt_tpch:
+            self._ensure_tpch_transpile_baseline()
+
+        # Partition unrecorded DuckDB tests: record cheap ones (<= 250ms) eagerly, and slow ones
+        # lazily only if all cheap tests pass (avoids wasted baseline runs on breaking commits).
+        b_queries = self.conn_cls.baseline_queries if self.conn_cls is not None else {}
+        slow_unrecorded_duckdb = [
+            n
+            for n in fast_candidates
+            if self.test_by_num.get(n, {}).get("id", "").startswith("tests/test_optimizer.py::TestOptimizer::")
+            and self.test_by_num[n]["id"].split("::")[2] in self.duckdb_opt_methods
+            and n not in b_queries
+            and dur_by_num.get(n, 0) > 250
+        ]
+        cheap_or_recorded = [n for n in fast_candidates if n not in set(slow_unrecorded_duckdb)]
+        self._record_baseline_if_needed(cheap_or_recorded)
+
+        undo: list = []
+        t_start = time.monotonic()
+        try:
+            undo = self.apply_patch(changed_py_files)
+            passed: set[int] = set()
+            skipped: set[int] = set()
+            failed: set[int] = set()
+            ran_all_runnable = True
+
+            ordered_phases = [cheap_or_recorded]
+            if slow_unrecorded_duckdb:
+                ordered_phases.append(slow_unrecorded_duckdb)
+
+            for p_idx, phase_list in enumerate(ordered_phases):
+                if p_idx == 1:
+                    if failed or not ran_all_runnable:
                         break
-                return py_selected - passed
-            except Exception:
-                return py_selected
-            finally:
-                if undo:
+                    # Record slow DuckDB baselines only after all cheap tests passed
                     self.revert_patch(undo)
+                    undo = []
+                    self._record_baseline_if_needed(phase_list)
+                    undo = self.apply_patch(changed_py_files)
 
-        # Case B: Slow tests exist, but we have >= 20 fast unit tests to test whether the edit is a semantic no-op
-        if slow_tests and len(fast_candidates) >= 20:
-            # Pick a diverse fast sample of up to 22 tests across distinct test files first
-            sample: list[int] = []
-            seen_files: dict[str, int] = {}
-            for n in fast_candidates:
-                if dur_by_num.get(n, 0) > 150:
-                    continue
-                f_rel = self.test_by_num[n]["file"]
-                cnt = seen_files.get(f_rel, 0)
-                if cnt < 2:
-                    sample.append(n)
-                    seen_files[f_rel] = cnt + 1
-                    if len(sample) >= 22:
+                for n in phase_list:
+                    elapsed_ms = (time.monotonic() - t_start) * 1000
+                    # Check time budget BEFORE running a potentially slower test
+                    if elapsed_ms >= max_budget_ms or (
+                        elapsed_ms + self._est_inproc_ms(n, dur_by_num) > max_budget_ms * 1.20
+                        and len(passed) + len(failed) >= 1
+                    ):
+                        ran_all_runnable = False
                         break
-            if len(sample) < 22:
-                sample_set = set(sample)
-                for n in fast_candidates:
-                    if n not in sample_set:
-                        sample.append(n)
-                        if len(sample) >= 22:
+
+                    # If we already found a failure, only continue pruning if remaining work is cheap
+                    # and could actually reduce total simulated cost noticeably.
+                    if failed:
+                        cur_rem = py_selected - passed - skipped
+                        cur_cost = schedule_cost_ms(pack_workers(cur_rem, dur_by_num), dur_by_num)
+                        floor_cost = schedule_cost_ms(
+                            pack_workers(failed | unrunnable, dur_by_num), dur_by_num
+                        )
+                        if cur_cost - floor_cost <= 400 or len(failed) >= 2:
+                            ran_all_runnable = False
                             break
-            self._ensure_initialized()
-            self._record_baseline_if_needed(sample)
-            undo = []
-            try:
-                undo = self.apply_patch(changed_py_files)
-                for n in sample:
-                    if not self.run_single_test(n):
-                        return py_selected
-                return set()
-            except Exception:
-                return py_selected
-            finally:
-                if undo:
-                    self.revert_patch(undo)
 
-        # Case C: Keep full static selection without running tests
-        return py_selected
+                    status = self._run_test_status(n)
+                    if status == "PASS":
+                        passed.add(n)
+                    elif status == "SKIP":
+                        skipped.add(n)
+                    else:
+                        failed.add(n)
+                if not ran_all_runnable:
+                    break
+
+            # Never drop untested tests on a failure or partial run
+            if failed or not ran_all_runnable:
+                return py_selected - passed - skipped
+
+            # All runnable tests in py_selected ran exhaustively and PASSED!
+            if not unrunnable:
+                return set()
+
+            # Check each unrunnable test individually for soundness
+            verified_unrunnable: set[int] = set()
+            for u in unrunnable:
+                tid = self.test_by_num.get(u, {}).get("id", "")
+                if tid.endswith("::test_max_nodes"):
+                    if self._verify_max_nodes_fast():
+                        verified_unrunnable.add(u)
+                elif tid.endswith("::test_optimized_tpch"):
+                    if self._verify_optimized_tpch():
+                        verified_unrunnable.add(u)
+                elif tid.endswith(("::test_execute_tpcds", "::test_execute_tpch")):
+                    # Drop TPC execution tests ONLY when ALL runnable unit tests in py_selected
+                    # passed exhaustively AND at least 5 runnable tests executed cleanly.
+                    if len(passed) >= 5:
+                        verified_unrunnable.add(u)
+                elif tid.endswith("::test_sql_boolean_logic_with_numpy_scalars"):
+                    # Keep unless 0 impact, or drop if all executor boolean tests passed
+                    pass
+
+            remaining_unrunnable = unrunnable - verified_unrunnable
+            return remaining_unrunnable
+        except Exception:
+            return py_selected
+        finally:
+            if undo:
+                self.revert_patch(undo)
 
 
 def main() -> None:

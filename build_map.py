@@ -494,7 +494,7 @@ def build_map(sqlglot_root: pathlib.Path, tests_json_path: pathlib.Path, output_
             py_sources[rel] = text
             compressed_sources[rel] = zlib.compress(text.encode("utf-8"), level=9)
 
-    # Collect non-TPC fixture files in tests/fixtures/ for in-process candidate test verification
+    # Collect non-TPC-CSV fixture files in tests/fixtures/ for in-process candidate test verification
     compressed_fixtures: dict[str, bytes] = {}
     fixtures_root = sqlglot_root / "tests" / "fixtures"
     if fixtures_root.exists():
@@ -502,7 +502,7 @@ def build_map(sqlglot_root: pathlib.Path, tests_json_path: pathlib.Path, output_
             if not p.is_file():
                 continue
             rel = str(p.relative_to(sqlglot_root)).replace("\\", "/")
-            if "/tpc-h/" in rel or "/tpc-ds/" in rel:
+            if rel.endswith(".csv.gz"):
                 continue
             compressed_fixtures[rel] = zlib.compress(p.read_bytes(), level=9)
 
